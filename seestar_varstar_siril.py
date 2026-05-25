@@ -35,6 +35,7 @@ from pipeline import (  # noqa: E402
     find_siril_cli,
     read_fits_header,
     stars_in_frame,
+    stars_in_safe_circle,
     find_siril_user_catalogue,
     update_siril_catalogue,
     query_vsx,
@@ -613,16 +614,18 @@ class App(tk.Tk):
                  + (s["dec"] - self.field_dec) ** 2) ** 0.5, 3
             )
 
-        # Keep only stars that project well inside the actual image frame.
-        # margin=200 gives ~200 px safety buffer on each side so that typical
-        # pointing drift over a session (50–150 px) doesn't cause the target
-        # to fall outside the registered-frame bounding box in many images.
+        # Keep only stars inside the alt-az safe zone: the inscribed circle of
+        # the frame (radius = min(W,H)/2).  With alt-az tracking, field rotation
+        # means only this circle is guaranteed to be covered by ALL registered
+        # frames — stars outside it can land in the black rotation corners.
         if self.field_wcs_hdr and self.field_naxis1 and self.field_naxis2:
-            filtered = stars_in_frame(stars, self.field_wcs_hdr,
-                                      self.field_naxis1, self.field_naxis2,
-                                      margin=200)
+            filtered = stars_in_safe_circle(stars, self.field_wcs_hdr,
+                                            self.field_naxis1, self.field_naxis2,
+                                            margin=50)
+            safe_r = min(self.field_naxis1, self.field_naxis2) / 2 - 50
             self._log(f"VSX: {len(stars)} in search area → "
-                      f"{len(filtered)} safely within image frame (margin 200 px)")
+                      f"{len(filtered)} inside alt-az safe zone "
+                      f"(inscribed circle r={safe_r:.0f} px)")
             stars = filtered
         else:
             self._log(f"VSX: {len(stars)} found (no WCS yet — plate-solve for exact filtering)")
@@ -723,8 +726,10 @@ class App(tk.Tk):
             self.lbl_prog.configure(text="Done!", fg=GREEN)
             self._log(f"✓  {msg}")
             messagebox.showinfo("Done!",
-                                f"Light curve saved:\n{msg}\n\n"
-                                "Results are in the results/ folder.")
+                                f"Results saved in:\n{msg}\n\n"
+                                "Files: light_curve.dat  ·  aavso.csv\n"
+                                "       photometry.csv  ·  light_curve.png\n"
+                                "       pipeline.log")
         else:
             self.lbl_prog.configure(text=f"Failed: {msg}", fg=RED)
             self._log(f"✗  {msg}")

@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import math
 import unittest
 
-from pipeline import sky_to_pixel, stars_in_frame
+from pipeline import sky_to_pixel, stars_in_frame, stars_in_safe_circle
 
 
 def _cdelt_hdr(crval1, crval2, crpix1, crpix2, cdelt_deg):
@@ -216,6 +216,80 @@ class TestSkyToPixelRotated(unittest.TestCase):
         for ra, dec in centre_samples:
             self.assertTrue(self._in_frame(ra, dec),
                             msg=f"Expected ({ra},{dec}) to be inside frame")
+
+
+class TestStarsInSafeCircle(unittest.TestCase):
+    """stars_in_safe_circle — alt-az inscribed circle filter."""
+
+    # Real Seestar rotated WCS (same header as TestSkyToPixelRotated)
+    HDR    = TestSkyToPixelRotated.HDR
+    W, H   = int(HDR["NAXIS1"]), int(HDR["NAXIS2"])   # 2160 × 3840
+    MARGIN = 50
+
+    def _star(self, ra, dec, name="S"):
+        return {"name": name, "ra": ra, "dec": dec, "mag": 12.0}
+
+    # ── Basic invariants ──────────────────────────────────────────────────────
+
+    def test_empty_input_returns_empty(self):
+        self.assertEqual(stars_in_safe_circle([], self.HDR, self.W, self.H), [])
+
+    def test_no_wcs_returns_all(self):
+        # Without WCS we cannot project → return stars unchanged (conservative)
+        s = self._star(self.HDR["CRVAL1"], self.HDR["CRVAL2"])
+        result = stars_in_safe_circle([s], {}, self.W, self.H)
+        self.assertEqual(len(result), 1)
+
+    def test_crval_star_included(self):
+        # Star at field centre is always inside the safe circle
+        s = self._star(self.HDR["CRVAL1"], self.HDR["CRVAL2"])
+        result = stars_in_safe_circle([s], self.HDR, self.W, self.H, self.MARGIN)
+        self.assertEqual(len(result), 1)
+
+    # ── Real-world cases ──────────────────────────────────────────────────────
+
+    def test_nsvs_edge_star_excluded(self):
+        # NSVS J0941171+685517: ~1387 px from centre > safe_r=1030 px → excluded
+        s = self._star(145.3213, 68.9214, "NSVS")
+        result = stars_in_safe_circle([s], self.HDR, self.W, self.H, self.MARGIN)
+        self.assertEqual(len(result), 0)
+
+    def test_es_uma_included(self):
+        # ES UMa: ~264 px from centre << safe_r=1030 px → included
+        s = self._star(148.619236, 69.222850, "ES UMa")
+        result = stars_in_safe_circle([s], self.HDR, self.W, self.H, self.MARGIN)
+        self.assertEqual(len(result), 1)
+
+    def test_apass_field_centre_comps_included(self):
+        # APASS stars near CRVAL (confirmed in-frame by earlier tests)
+        centre_samples = [
+            (149.7710, 68.7973),
+            (148.9206, 69.0633),
+            (149.2537, 68.9019),
+        ]
+        stars = [self._star(ra, dec, f"S{i}") for i, (ra, dec) in enumerate(centre_samples)]
+        result = stars_in_safe_circle(stars, self.HDR, self.W, self.H, self.MARGIN)
+        self.assertEqual(len(result), 3)
+
+    def test_mixed_in_and_out(self):
+        centre = self._star(self.HDR["CRVAL1"], self.HDR["CRVAL2"], "centre")
+        edge   = self._star(145.3213, 68.9214, "NSVS")
+        result = stars_in_safe_circle([centre, edge], self.HDR, self.W, self.H, self.MARGIN)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "centre")
+
+    # ── Radius boundary ───────────────────────────────────────────────────────
+
+    def test_safe_radius_is_min_half_minus_margin(self):
+        # Verify computed safe_r = min(W,H)/2 - margin = 1080 - 50 = 1030 px
+        safe_r = min(self.W, self.H) / 2.0 - self.MARGIN
+        self.assertAlmostEqual(safe_r, 1030.0, places=1)
+
+    def test_zero_margin_gives_full_inscribed_circle(self):
+        # With margin=0, NSVS at 1387 px should still be outside (>1080)
+        s = self._star(145.3213, 68.9214, "NSVS")
+        result = stars_in_safe_circle([s], self.HDR, self.W, self.H, margin=0)
+        self.assertEqual(len(result), 0)
 
 
 if __name__ == "__main__":

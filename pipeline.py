@@ -13,11 +13,12 @@ import math
 import os
 import platform
 import shutil
+import statistics
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 # ── optional runtime deps ────────────────────────────────────────────────────
 
@@ -35,6 +36,14 @@ try:
     HAS_SIRILPY = True
 except ImportError:
     HAS_SIRILPY = False
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
 
 # ── hardware profile ─────────────────────────────────────────────────────────
 
@@ -182,6 +191,40 @@ def stars_in_frame(stars: list[dict], wcs_hdr: dict,
             continue
         if (margin < px <= naxis1 - margin and
                 margin < py <= naxis2 - margin):
+            inside.append(star)
+    return inside
+
+
+def stars_in_safe_circle(stars: list[dict], wcs_hdr: dict,
+                          naxis1: int, naxis2: int,
+                          margin: int = 50) -> list[dict]:
+    """Return stars inside the inscribed circle of the frame.
+
+    For alt-az mounts, field rotation means only the inscribed circle
+    (radius = min(naxis1, naxis2) / 2) is guaranteed to be covered by
+    every registered frame.  Stars outside this circle may land in the
+    black rotation corners of some frames.
+
+    margin: pixels of safety buffer inside the circle boundary (absorbs
+    registration drift and photometry aperture clipping).
+    """
+    if not wcs_hdr:
+        return stars
+    try:
+        crpix1 = float(wcs_hdr.get("CRPIX1", (naxis1 + 1) / 2.0))
+        crpix2 = float(wcs_hdr.get("CRPIX2", (naxis2 + 1) / 2.0))
+    except (ValueError, TypeError):
+        return stars
+    safe_r = min(naxis1, naxis2) / 2.0 - margin
+    if safe_r <= 0:
+        return []
+    safe_r2 = safe_r ** 2
+    inside = []
+    for star in stars:
+        px, py = sky_to_pixel(star["ra"], star["dec"], wcs_hdr)
+        if px is None:
+            continue
+        if (px - crpix1) ** 2 + (py - crpix2) ** 2 <= safe_r2:
             inside.append(star)
     return inside
 
@@ -435,6 +478,104 @@ def truncate_comp_csv(csv_path: Path, n: int) -> int:
         return 0
 
 
+def _parse_comp_csv_vmag(path: Path) -> Optional[float]:
+    """Return median V mag of comparison stars from a Siril findcompstars CSV.
+
+    Format: comment lines (#), then 'type,name,ra,dec,mag' header, then data rows
+    where rows starting with 'Comp' have catalog V magnitudes in column 5 (index 4).
+    """
+    vmags: list[float] = []
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(",")
+                if len(parts) >= 5 and parts[0].startswith("Comp"):
+                    try:
+                        vmags.append(float(parts[4]))
+                    except ValueError:
+                        pass
+    except Exception:
+        return None
+    return statistics.median(vmags) if vmags else None
+
+
+def export_fwhm_csv(seq_path: Path, proc: Path, stem: str,
+                    fixlen: int, out: Path,
+                    plate_scale_arcsec: float = 1.035) -> int:
+    """Extract per-frame FWHM from a Siril .seq file and write fwhm.csv.
+
+    The .seq R0 lines contain FWHM in pixels from the registration star detection.
+    Each R0 line is matched to its frame via the corresponding I line.
+    DATE-OBS is read from each FITS header to build the JD axis.
+
+    Returns number of rows written (0 on failure).
+    """
+    # Parse .seq: build list of (frame_num, selected, fwhm_x, fwhm_y)
+    entries: list[tuple[int, bool, float, float]] = []
+    try:
+        frame_nums: list[int] = []
+        selected:   list[bool] = []
+        with open(seq_path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("I "):
+                    parts = line.split()
+                    frame_nums.append(int(parts[1]))
+                    selected.append(parts[2].strip() == "1")
+        # R0 lines appear in the same order as I lines
+        r0_idx = 0
+        r0_data: list[tuple[float, float]] = []
+        with open(seq_path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("R0 "):
+                    parts = line.split()
+                    # R0 fwhm_x fwhm_y roundness ...
+                    r0_data.append((float(parts[1]), float(parts[2])))
+        for i, (fn, sel) in enumerate(zip(frame_nums, selected)):
+            if i < len(r0_data):
+                fx, fy = r0_data[i]
+                entries.append((fn, sel, fx, fy))
+    except Exception:
+        return 0
+
+    if not entries:
+        return 0
+
+    # Read DATE-OBS from each selected FITS header → JD
+    rows: list[tuple[float, float, float]] = []   # (jd, fwhm_x_as, fwhm_y_as)
+    for fn, sel, fx, fy in entries:
+        if not sel or fx <= 0:
+            continue
+        fit = proc / f"{stem}_{fn:0{fixlen}d}.fit"
+        if not fit.exists():
+            continue
+        hdr  = read_fits_header(fit)
+        dobs = hdr.get("DATE-OBS") or hdr.get("DATE_OBS") or hdr.get("DATE")
+        if not dobs:
+            continue
+        jd = dateobs_to_jd(str(dobs))
+        if jd is None:
+            continue
+        rows.append((jd, fx * plate_scale_arcsec, fy * plate_scale_arcsec))
+
+    if not rows:
+        return 0
+
+    rows.sort(key=lambda r: r[0])
+    try:
+        with open(out, "w", newline="", encoding="utf-8") as f:
+            f.write("# FWHM per frame from Siril registration star detection\n")
+            f.write(f"# Plate scale: {plate_scale_arcsec:.4f} arcsec/px\n")
+            f.write("JD,FWHM_x_arcsec,FWHM_y_arcsec\n")
+            for jd, fx, fy in rows:
+                f.write(f"{jd:.6f},{fx:.3f},{fy:.3f}\n")
+    except Exception:
+        return 0
+    return len(rows)
+
+
 def dateobs_to_jd(date_str: str) -> Optional[float]:
     """Convert a FITS DATE-OBS string (ISO 8601) to Julian Date."""
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
@@ -629,6 +770,122 @@ def export_aavso(dat: Path, out: Path, name: str,
     return rows
 
 
+def export_photometry_csv(dat: Path, out: Path, star_name: str,
+                           ensemble_vmag: Optional[float] = None) -> int:
+    """Write a simple photometry CSV with differential and optional apparent magnitudes.
+
+    Columns: JD, V_C (differential V-minus-ensemble), V_app (if ensemble_vmag known), err.
+    All rows included (including high-error ones); NaN magnitudes skipped.
+    Returns number of data rows written.
+    """
+    rows_written = 0
+    with open(dat) as f_in, open(out, "w", newline="", encoding="utf-8") as f_out:
+        f_out.write(f"# Star: {star_name}\n")
+        if ensemble_vmag is not None:
+            f_out.write(f"# Ensemble V (APASS comp stars median): {ensemble_vmag:.3f}\n")
+            f_out.write("# V_app = V_C + ensemble_V  (approximate apparent V magnitude)\n")
+        w = csv.writer(f_out)
+        if ensemble_vmag is not None:
+            w.writerow(["JD", "V_C", "V_app", "err"])
+        else:
+            w.writerow(["JD", "V_C", "err"])
+
+        for line in f_in:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            try:
+                jd_i = next(i for i, p in enumerate(parts) if float(p) > 2_400_000)
+                jd   = float(parts[jd_i])
+                vc   = float(parts[jd_i + 1])
+                err  = float(parts[jd_i + 2]) if len(parts) > jd_i + 2 else 0.0
+                if math.isnan(vc):
+                    continue
+                if ensemble_vmag is not None:
+                    w.writerow([f"{jd:.6f}", f"{vc:.4f}",
+                                f"{vc + ensemble_vmag:.4f}", f"{err:.4f}"])
+                else:
+                    w.writerow([f"{jd:.6f}", f"{vc:.4f}", f"{err:.4f}"])
+                rows_written += 1
+            except (ValueError, StopIteration, IndexError):
+                continue
+    return rows_written
+
+
+def generate_light_curve_plot(dat: Path, out: Path, star_name: str,
+                               ensemble_vmag: Optional[float] = None) -> bool:
+    """Generate a two-panel matplotlib light curve (differential + apparent if known).
+
+    Returns True if the plot was saved successfully.
+    """
+    if not HAS_MATPLOTLIB:
+        return False
+
+    jds, vcs, errs = [], [], []
+    with open(dat) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            try:
+                jd_i = next(i for i, p in enumerate(parts) if float(p) > 2_400_000)
+                jd   = float(parts[jd_i])
+                vc   = float(parts[jd_i + 1])
+                err  = float(parts[jd_i + 2]) if len(parts) > jd_i + 2 else 0.0
+                if math.isnan(vc) or math.isnan(err):
+                    continue
+                jds.append(jd); vcs.append(vc); errs.append(err)
+            except (ValueError, StopIteration, IndexError):
+                continue
+
+    if not jds:
+        return False
+
+    jd0 = int(min(jds))
+    xs  = [j - jd0 for j in jds]
+
+    has_apparent = ensemble_vmag is not None
+    n_panels     = 2 if has_apparent else 1
+    fig, axes    = plt.subplots(n_panels, 1,
+                                figsize=(11, 4 * n_panels),
+                                squeeze=False,
+                                sharex=True)
+    fig.suptitle(star_name, fontsize=13, fontweight="bold")
+
+    kw = dict(fmt="o", ms=3, elinewidth=0.8, capsize=2)
+
+    ax1 = axes[0][0]
+    ax1.errorbar(xs, vcs, yerr=errs, color="#5294e2", ecolor="#aaaaaa", **kw)
+    ax1.set_ylabel("V − C  (differential)")
+    ax1.invert_yaxis()
+    ax1.grid(alpha=0.25)
+    ax1.set_title("Differential photometry  (V − C)")
+
+    if has_apparent:
+        vapps = [v + ensemble_vmag for v in vcs]
+        ax2 = axes[1][0]
+        ax2.errorbar(xs, vapps, yerr=errs, color="#7ab648", ecolor="#aaaaaa", **kw)
+        ax2.set_ylabel("V  (apparent)")
+        ax2.invert_yaxis()
+        ax2.grid(alpha=0.25)
+        ax2.set_title(f"Apparent magnitude  "
+                      f"(ensemble comp V = {ensemble_vmag:.2f})")
+        ax2.set_xlabel(f"JD − {jd0}")
+    else:
+        ax1.set_xlabel(f"JD − {jd0}")
+
+    plt.tight_layout()
+    try:
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+    except Exception:
+        plt.close(fig)
+        return False
+    plt.close(fig)
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ─────────────────────────────────────────────────────────────────────────────
@@ -670,6 +927,37 @@ def run_pipeline(config: dict,
     lights  = session / "lights"
     masters = proc / "masters"
     proc.mkdir(exist_ok=True)
+
+    # ── Per-star output subfolder (results/<safe_name>/) ──────────────────────
+    safe        = star["name"].replace(" ", "_").replace("/", "-")
+    results_dir = session / "results" / safe
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Log file — accumulate entries; write atomically when pipeline ends ─────
+    _log: list[str] = [
+        f"# Seestar Variable Star Pipeline v{VERSION}",
+        f"# Target : {star['name']}  RA={star['ra']:.5f}  Dec={star['dec']:+.5f}",
+        f"# Session: {session}",
+        f"# Started: {datetime.datetime.now().isoformat()}",
+        "",
+    ]
+    _orig_on_log = on_log
+
+    def on_log(msg: str) -> None:  # shadows the callback parameter
+        _log.append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
+        _orig_on_log(msg)
+
+    _orig_on_done = on_done
+
+    def on_done(ok: bool, msg: str) -> None:  # shadows the callback parameter
+        _log.append(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] "
+                    f"{'SUCCESS' if ok else 'FAILED'}: {msg}")
+        try:
+            (results_dir / "pipeline.log").write_text(
+                "\n".join(_log) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        _orig_on_done(ok, msg)
 
     focal = SEESTAR["focal"]
     pixsz = SEESTAR["pixsz"]
@@ -756,7 +1044,7 @@ def run_pipeline(config: dict,
         on_log("─── Step 3: seqapplyreg ───")
         if not runner.run_script(proc, [
             f'cd "{proc}"',
-            f"seqapplyreg {seq} -framing=cog -filter-round=2.5k",
+            f"seqapplyreg {seq} -framing=min -filter-round=2.5k",
         ], "_s3_applyreg.ssf"):
             on_done(False, "Step 3 failed (seqapplyreg)")
             return
@@ -768,7 +1056,7 @@ def run_pipeline(config: dict,
         on_log("─── Step 3: seqapplyreg ───")
         if not runner.run_script(proc, [
             f'cd "{proc}"',
-            f"seqapplyreg {seq} -framing=cog -filter-round=2.5k",
+            f"seqapplyreg {seq} -framing=min -filter-round=2.5k",
         ], "_s3_applyreg.ssf"):
             on_done(False, "Step 3 failed (seqapplyreg)")
             return
@@ -844,28 +1132,39 @@ def run_pipeline(config: dict,
         return round(fx - 0.5), round(naxis2 - fy + 0.5)
 
     # ── Early frame check (before any findcompstars / APASS query) ────────────
-    # margin=200 px: typical session drift (50-150 px) means edge stars miss
-    # many registered frames. 200 px ensures coverage in virtually all frames.
+    # For alt-az mounts, field rotation limits the reliable area to the inscribed
+    # circle of the frame (radius = min(NAXIS1, NAXIS2) / 2).  Stars outside this
+    # circle may fall into the black rotation corners of some registered frames.
+    # With -framing=min, black corners are already eliminated, but the inscribed
+    # circle check is still the correct conservative bound for the VSX-filtered
+    # candidates.
     tdx: Optional[int] = None
     tdy: Optional[int] = None
-    FRAME_MARGIN = 200   # safety buffer for target; comp stars use phot_margin=35
+    SAFE_MARGIN = 50   # px buffer inside inscribed circle (absorbs drift + aperture)
     if naxis1 and naxis2:
         tx, ty = sky_to_pixel(star["ra"], star["dec"], ref_hdr)
         if tx is not None:
             tdx, tdy = _to_disp(tx, ty)
-            if not (FRAME_MARGIN < tdx < naxis1 - FRAME_MARGIN and
-                    FRAME_MARGIN < tdy < naxis2 - FRAME_MARGIN):
+            # Inscribed circle check in display pixel space
+            cx, cy = naxis1 / 2.0, naxis2 / 2.0
+            safe_r  = min(naxis1, naxis2) / 2.0 - SAFE_MARGIN
+            dist_sq = (tdx - cx) ** 2 + (tdy - cy) ** 2
+            if dist_sq > safe_r ** 2:
+                dist_px = dist_sq ** 0.5
                 on_done(False,
-                        f"'{star['name']}' is too close to the frame edge "
-                        f"(pixel {tdx},{tdy}, frame {naxis1}×{naxis2}, "
-                        f"safe zone {FRAME_MARGIN}px margin).\n"
-                        "Registration drift means this star is missing from "
-                        "many frames. Re-run the VSX query and choose a star "
-                        "closer to the field centre.")
+                        f"'{star['name']}' is outside the alt-az safe zone.\n"
+                        f"Distance from field centre: {dist_px:.0f} px, "
+                        f"safe radius: {safe_r:.0f} px "
+                        f"(inscribed circle of {naxis1}×{naxis2} − {SAFE_MARGIN} px margin).\n"
+                        "Field rotation on an alt-az mount means this star lands in the "
+                        "black corners of many registered frames.\n"
+                        "Re-run the VSX query and choose a star closer to the field centre.")
                 return
-            on_log(f"Target at display pixel ({tdx}, {tdy}) — in frame ✓")
+            on_log(f"Target at display pixel ({tdx}, {tdy}) — inside alt-az safe zone ✓")
         else:
             on_log("Frame WCS not available — skipping bounds check")
+
+    ensemble_vmag: Optional[float] = None   # comp-star median V; enables apparent mag
 
     # ── PRIMARY: findcompstars → -ninastars ───────────────────────────────────
     # VSX names sometimes have a "V* " prefix that GCVS/SIMBAD doesn't use.
@@ -885,6 +1184,10 @@ def run_pipeline(config: dict,
         ], "_s5a_findcomp.ssf")
         if comp_csv.exists() and comp_csv.stat().st_size > 50:
             kept = truncate_comp_csv(comp_csv, max(3, min(50, nstars)))
+            ensemble_vmag = _parse_comp_csv_vmag(comp_csv)
+            if ensemble_vmag is not None:
+                on_log(f"[PRIMARY] ensemble comp V = {ensemble_vmag:.2f} "
+                       f"(median of {kept} APASS stars from comp_stars.csv)")
             lc_cmd = f"light_curve {registered} 0 -ninastars=comp_stars.csv"
             on_log(f"[PRIMARY] OK — {kept} comp stars via findcompstars")
         else:
@@ -904,7 +1207,8 @@ def run_pipeline(config: dict,
 
     if lc_cmd is None and comp_stars and tdx is not None and naxis1:
         margin = 35
-        ref_pix = []
+        ref_pix: list[tuple[int, int]] = []
+        _ens_comps: list[dict] = []   # in-frame comps tracked for ensemble Vmag
         for cs in comp_stars:
             rx, ry = sky_to_pixel(cs["ra"], cs["dec"], ref_hdr)
             if rx is not None:
@@ -912,6 +1216,7 @@ def run_pipeline(config: dict,
                 if (margin < rdx < naxis1 - margin and
                         margin < rdy < naxis2 - margin):
                     ref_pix.append((rdx, rdy))
+                    _ens_comps.append(cs)
         if not ref_pix and ref_hdr.get("CRVAL1"):
             # Target near the field edge — retry APASS around the frame centre so
             # at least some reference stars land inside the image.
@@ -927,11 +1232,17 @@ def run_pipeline(config: dict,
                     if (margin < rdx < naxis1 - margin and
                             margin < rdy < naxis2 - margin):
                         ref_pix.append((rdx, rdy))
+                        _ens_comps.append(cs)
             if ref_pix:
                 on_log(f"[FALLBACK A] {len(ref_pix)} comp stars from field centre")
             else:
                 on_log("[FALLBACK A] no comp stars in frame (tried target + field centre)")
         if ref_pix:
+            _vmags = [cs["vmag"] for cs in _ens_comps if cs.get("vmag", 0) > 0]
+            if _vmags:
+                ensemble_vmag = statistics.median(_vmags)
+                on_log(f"[FALLBACK A] ensemble comp V = {ensemble_vmag:.2f} "
+                       f"(median of {len(_vmags)} APASS stars)")
             lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
             for rdx, rdy in ref_pix:
                 lc_cmd += f" -refat={rdx},{rdy}"
@@ -969,11 +1280,21 @@ def run_pipeline(config: dict,
                     "The target may be at the edge of the field with no suitable "
                     "APASS reference stars in the image. Try a different star.")
             return
+        _vmags = [cs["vmag"] for cs in inframe_comps if cs.get("vmag", 0) > 0]
+        if _vmags:
+            ensemble_vmag = statistics.median(_vmags)
         on_log("[FALLBACK B] using sky coordinates (-wcs/-refwcs)")
         lc_cmd = (f"light_curve {registered} 0 "
                   f"-wcs={star['ra']:.6f},{star['dec']:.6f}")
         for cs in inframe_comps:
             lc_cmd += f" -refwcs={cs['ra']:.6f},{cs['dec']:.6f}"
+
+    # Delete any stale light_curve.dat from a previous star's run so we never
+    # silently pick up the wrong data if Siril fails to write a new one.
+    stale_dat = proc / "light_curve.dat"
+    if stale_dat.exists():
+        stale_dat.unlink()
+        on_log("Removed stale light_curve.dat from previous run")
 
     # Strip BAYERPAT before light_curve to work around a Siril 1.4.3 bug:
     # copyfits(CP_FORMAT) clears date_obs in the CFA copy used for PSF fitting,
@@ -998,17 +1319,24 @@ def run_pipeline(config: dict,
     if bayer_stripped:
         on_log("BAYERPAT restored")
 
+    # Siril light_curve exits non-zero when ANY frame fails PSF fitting (e.g. target
+    # lands in a black corner on some frames).  It still writes light_curve.dat for
+    # the frames that succeeded.  Treat a non-empty dat file as partial success.
+    lc_dat = proc / "light_curve.dat"
     if not ok:
-        on_done(False, "Step 5 failed (light_curve)")
-        return
+        if lc_dat.exists() and lc_dat.stat().st_size > 50:
+            on_log("Step 5 partially succeeded — some frames failed PSF, "
+                   "processing available data")
+        else:
+            on_done(False, "Step 5 failed (light_curve — no output produced)")
+            return
 
     # ── Collect results ───────────────────────────────────────────────────────
-    lc_dat = proc / "light_curve.dat"
-    results_dir = session / "results"
-    results_dir.mkdir(exist_ok=True)
-    safe = star["name"].replace(" ", "_").replace("/", "-")
-    out_dat = results_dir / f"{safe}_light_curve.dat"
-    out_csv = results_dir / f"{safe}_aavso.csv"
+    # results_dir / safe defined at top of function; subfolder already created.
+    out_dat  = results_dir / "light_curve.dat"
+    out_csv  = results_dir / "aavso.csv"
+    out_phot = results_dir / "photometry.csv"
+    out_png  = results_dir / "light_curve.png"
 
     if lc_dat.exists():
         try:
@@ -1020,19 +1348,39 @@ def run_pipeline(config: dict,
             on_log("JD normalized to absolute JD ✓")
         shutil.copy2(lc_dat, out_dat)
 
-        out_png = results_dir / f"{safe}_light_curve.png"
-        png = proc / "light_curve.png"
-        if png.exists():
-            shutil.copy2(png, out_png)
-
+        # AAVSO extended format (differential V-C, ENSEMBLE comp)
         rows = export_aavso(out_dat, out_csv, star["name"],
                             filt_code=filt_code, filt_note=filt_note)
         n_valid = len(rows)
-        n_total = sum(1 for l in out_dat.read_text().splitlines()
-                      if l and not l.startswith("#"))
+        n_total = sum(1 for ln in out_dat.read_text().splitlines()
+                      if ln and not ln.startswith("#"))
         on_log(f"AAVSO CSV: {n_valid}/{n_total} pts exported "
                f"(NaN and MERR>0.5 excluded)")
-        on_done(True, str(out_dat))
+
+        # Simple photometry CSV with optional apparent magnitude
+        n_phot = export_photometry_csv(out_dat, out_phot, star["name"], ensemble_vmag)
+        if ensemble_vmag is not None:
+            on_log(f"Photometry CSV: {n_phot} pts, apparent V = V_C + {ensemble_vmag:.2f}")
+        else:
+            on_log(f"Photometry CSV: {n_phot} pts (apparent mag unavailable — PRIMARY path)")
+
+        # FWHM per frame from registration .seq (plate scale ~1.035"/px for Seestar)
+        out_fwhm = results_dir / "fwhm.csv"
+        n_fwhm = export_fwhm_csv(seq_file, proc, stem, seq_fixlen, out_fwhm,
+                                  plate_scale_arcsec=1.035)
+        if n_fwhm:
+            on_log(f"FWHM CSV: {n_fwhm} frames written → {out_fwhm.name}")
+        else:
+            on_log("FWHM CSV: skipped (no registration FWHM in .seq)")
+
+        # Matplotlib plot (two panels if apparent mag known; fallback to Siril's plot)
+        plotted = generate_light_curve_plot(out_dat, out_png, star["name"], ensemble_vmag)
+        if not plotted:
+            png = proc / "light_curve.png"
+            if png.exists():
+                shutil.copy2(png, out_png)
+
+        on_done(True, str(results_dir))
     else:
         on_done(False,
                 "light_curve.dat not found.\n"
