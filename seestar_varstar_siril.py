@@ -650,34 +650,55 @@ class App(tk.Tk):
         ))
 
     def _show_field_annotated(self):
-        """Load the stacked image in Siril's GUI and trigger the annotation overlay."""
+        """Load a plate-solved image in Siril's GUI and trigger the annotation overlay.
+
+        Prefer a registered plate-solved frame (has WCS from step 4) so that annotate
+        can position the circles immediately.  Fall back to the stack + platesolve when
+        no registered frames exist yet.
+        """
         if not self.session_dir or not self.runner:
             return
-        session = self.session_dir
-        stack = None
-        for cand in ["process/lights.fit", "process/result.fit"]:
-            p = session / cand
-            if p.exists():
-                stack = p
+        proc = self.session_dir / "process"
+
+        # Registered plate-solved frames (step 4) already have WCS — use the middle one
+        # so we pick a well-exposed frame near the reference rather than frame #1.
+        target: Optional[Path] = None
+        need_platesolve = False
+        for seq in ("r_light_", "r_pp_light_"):
+            frames = sorted(proc.glob(f"{seq.rstrip('_')}*.fit"))
+            if frames:
+                target = frames[len(frames) // 2]
                 break
-        if stack is None:
-            for p in session.glob("*_og.fit"):
-                stack = p
+
+        # Fall back to the stack; we'll plate-solve it on the fly.
+        if target is None:
+            for cand in ["process/lights.fit", "process/result.fit"]:
+                p = self.session_dir / cand
+                if p.exists():
+                    target, need_platesolve = p, True
+                    break
+        if target is None:
+            for p in self.session_dir.glob("*_og.fit"):
+                target, need_platesolve = p, True
                 break
-        if stack is None:
+        if target is None:
             return
 
         iface = getattr(self.runner, "_iface", None)
-        if iface:
-            try:
-                iface.cmd("load", str(stack))
-                iface.cmd("annotate")
-                self._log("Siril: variable stars annotated in main window")
-            except Exception as e:
-                self._log(f"Siril annotate: {e}")
-        else:
+        if not iface:
             self._log("Tip: in Siril open the stack and use "
                       "Outils > Astrométrie > Annoter to see the stars")
+            return
+
+        try:
+            iface.cmd("load", str(target))
+            if need_platesolve:
+                self._log("Siril: plate-solving stack for annotation…")
+                iface.cmd("platesolve", "-focal=160", "-pixelsize=2.9", "-radius=2.5")
+            iface.cmd("annotate")
+            self._log("Siril: variable stars annotated in main window")
+        except Exception as e:
+            self._log(f"Siril annotate: {e}")
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
 
