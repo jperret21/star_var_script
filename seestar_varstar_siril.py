@@ -97,6 +97,46 @@ def read_fits_header(path: Path) -> dict:
     return header
 
 
+def _fits_strip_keyword(path: Path, keyword: str) -> Optional[tuple[int, str]]:
+    """Remove a FITS header keyword in-place. Returns (byte_offset, value) for restore."""
+    kw_bytes = keyword.upper().ljust(8, ' ').encode('ascii')
+    try:
+        with open(path, 'r+b') as f:
+            block_start = 0
+            while True:
+                block = f.read(2880)
+                if len(block) < 80:
+                    break
+                for i in range(0, len(block), 80):
+                    card = block[i:i+80]
+                    if card[:8] == kw_bytes:
+                        val = card[10:80].decode('ascii', errors='ignore')
+                        val = val.split('/')[0].strip().strip("'").strip()
+                        f.seek(block_start + i)
+                        f.write(b' ' * 80)
+                        return (block_start + i, val)
+                    if card[:3] == b'END' and (len(card) < 4 or card[3:4] in (b' ', b'\x00')):
+                        return None
+                block_start += 2880
+    except Exception:
+        pass
+    return None
+
+
+def _fits_restore_keyword(path: Path, keyword: str, offset: int, value: str) -> bool:
+    """Restore a FITS keyword card at the exact byte offset it was removed from."""
+    kw = keyword.upper().ljust(8, ' ')[:8]
+    card = f"{kw}= '{value:<8}'"
+    card_bytes = card.encode('ascii').ljust(80)[:80]
+    try:
+        with open(path, 'r+b') as f:
+            f.seek(offset)
+            f.write(card_bytes)
+        return True
+    except Exception:
+        return False
+
+
 def sky_to_pixel(ra: float, dec: float, hdr: dict):
     """
     TAN gnomonic projection (ignores SIP, which is sub-pixel at Seestar scale):
@@ -335,13 +375,63 @@ def dateobs_to_jd(date_str: str) -> Optional[float]:
 def inject_jd_into_dat(dat_path: Path, seq_path: Path,
                        stem: str, fixlen: int, proc: Path,
                        exptime_s: float = 20.0) -> bool:
-    """Replace frame-index JD column in light_curve.dat with real Julian Dates.
+    """Normalize light_curve.dat to absolute JD regardless of Siril's output format.
 
-    Reads DATE-OBS from each r_light_XXXXX.fit file (selected frames in seq order).
-    Adds half the exposure time for mid-exposure JD.
-    Returns True if at least one JD was injected.
+    Siril 1.4.3 outputs three possible formats depending on whether date_obs was
+    populated in the sequence:
+      - '#JD_UT (+ 0)' + frame indices 1,2,3…  → inject JD from FITS DATE-OBS
+      - '#JD_UT (+ N)' + fractional offsets     → add N to convert to absolute JD
+      - '#JD_UT'        + absolute JD already   → already correct, no-op
+
+    Returns True if file was modified.
     """
-    # Build ordered list of img_numbers for selected frames
+    try:
+        text = dat_path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+    except Exception:
+        return False
+
+    # Parse julian0 from the first '#JD_UT' header line
+    julian0 = None
+    for line in lines:
+        if line.startswith("#JD_UT"):
+            # '#JD_UT (+ 2461161)' or '#JD_UT (+ 0)' or '#JD_UT'
+            if "(+" in line:
+                try:
+                    julian0 = int(line.split("(+")[1].split(")")[0].strip())
+                except (ValueError, IndexError):
+                    julian0 = 0
+            else:
+                julian0 = None  # already absolute JD
+            break
+
+    if julian0 is None:
+        return False  # already in absolute JD format, nothing to do
+
+    out: list[str] = []
+
+    if julian0 > 2_400_000:
+        # Correct Siril output: fractional day offsets from julian0
+        for line in lines:
+            if line.startswith("#JD_UT"):
+                out.append("#JD_UT")
+                continue
+            if line.startswith("#"):
+                out.append(line)
+                continue
+            parts = line.split()
+            if parts:
+                try:
+                    offset = float(parts[0])
+                    if offset < 10:  # fractional offset, not already absolute
+                        parts[0] = f"{julian0 + offset:.6f}"
+                except (ValueError, IndexError):
+                    pass
+            out.append(" ".join(parts))
+        dat_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        return True
+
+    # julian0 == 0: frame indices → inject from FITS DATE-OBS
     selected_imgs: list[int] = []
     try:
         with open(seq_path) as fh:
@@ -354,7 +444,6 @@ def inject_jd_into_dat(dat_path: Path, seq_path: Path,
     except Exception:
         return False
 
-    # Map 1-based frame index → JD
     jd_map: dict[int, float] = {}
     half_exp = exptime_s / 86400.0 / 2.0
     for idx, img_num in enumerate(selected_imgs, start=1):
@@ -364,35 +453,29 @@ def inject_jd_into_dat(dat_path: Path, seq_path: Path,
         if date_str:
             jd = dateobs_to_jd(date_str)
             if jd is not None:
-                jd_map[idx] = jd + half_exp  # mid-exposure
+                jd_map[idx] = jd + half_exp
 
     if not jd_map:
         return False
 
-    # Rewrite dat file: replace integer frame index with real JD
-    try:
-        lines = dat_path.read_text(encoding="utf-8").splitlines()
-        out: list[str] = []
-        for line in lines:
-            if "#JD_UT (+ 0)" in line:
-                out.append("#JD_UT")
-                continue
-            if line.startswith("#"):
-                out.append(line)
-                continue
-            parts = line.split()
-            if parts:
-                try:
-                    idx = round(float(parts[0]))
-                    if idx in jd_map:
-                        parts[0] = f"{jd_map[idx]:.6f}"
-                except (ValueError, KeyError):
-                    pass
-            out.append(" ".join(parts))
-        dat_path.write_text("\n".join(out) + "\n", encoding="utf-8")
-        return True
-    except Exception:
-        return False
+    for line in lines:
+        if line.startswith("#JD_UT"):
+            out.append("#JD_UT")
+            continue
+        if line.startswith("#"):
+            out.append(line)
+            continue
+        parts = line.split()
+        if parts:
+            try:
+                idx = round(float(parts[0]))
+                if idx in jd_map:
+                    parts[0] = f"{jd_map[idx]:.6f}"
+            except (ValueError, KeyError):
+                pass
+        out.append(" ".join(parts))
+    dat_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return True
 
 
 def get_gain_eadu(lights_dir: Path) -> float:
@@ -421,93 +504,6 @@ def get_gain_eadu(lights_dir: Path) -> float:
             except (ValueError, TypeError):
                 pass
     return 1.0
-
-
-def generate_light_curve_plot(dat_path: Path, out_path: Path,
-                               star_name: str, merr_max: float = 0.5) -> bool:
-    """Generate a publication-quality light curve PNG from a Siril .dat file.
-
-    Reads JD, V-C magnitude and uncertainty. Filters NaN and MERR > merr_max.
-    X-axis: UT time (hours). Y-axis: V-C differential mag (inverted, brighter up).
-    Returns True on success.
-    """
-    try:
-        import matplotlib
-    except ImportError:
-        # Siril's embedded Python may lack matplotlib — add common install paths
-        import sys as _sys
-        for _sp in [
-            "/opt/homebrew/lib/python3.11/site-packages",
-            "/opt/homebrew/lib/python3.12/site-packages",
-            "/opt/homebrew/lib/python3.13/site-packages",
-            "/usr/local/lib/python3.11/site-packages",
-            "/usr/local/lib/python3.12/site-packages",
-        ]:
-            if _sp not in _sys.path:
-                _sys.path.insert(0, _sp)
-        try:
-            import matplotlib
-        except ImportError:
-            return False
-    try:
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.ticker as ticker
-    except Exception:
-        return False
-
-    jds, mags, errs = [], [], []
-    with open(dat_path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            try:
-                jd  = float(parts[0])
-                mag = float(parts[1])
-                err = float(parts[2]) if len(parts) > 2 else 0.0
-                if math.isnan(mag) or math.isnan(err) or err > merr_max:
-                    continue
-                if jd < 2_400_000:   # still frame indices — skip
-                    continue
-                jds.append(jd); mags.append(mag); errs.append(err)
-            except (ValueError, IndexError):
-                continue
-
-    if len(jds) < 3:
-        return False
-
-    # Convert JD to UT hours: (JD − 0.5) mod 1 × 24
-    ut = [((j - 0.5) % 1) * 24 for j in jds]
-
-    # Derive observation date from first JD
-    epoch = datetime.datetime(2000, 1, 1, 12, 0, 0)
-    obs_dt = epoch + datetime.timedelta(days=jds[0] - 2451545.0)
-    date_str = obs_dt.strftime("%Y-%m-%d")
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.errorbar(ut, mags, yerr=errs, fmt="o", ms=3.5,
-                color="#5294e2", ecolor="#aaaaaa",
-                capsize=2, linewidth=0.7, label="V−C")
-    ax.invert_yaxis()   # photometric convention: brighter at top
-    ax.set_xlabel(f"UT {date_str} (hours)", fontsize=12)
-    ax.set_ylabel("V−C  (instrumental diff. mag)", fontsize=12)
-    ax.set_title(f"Light curve — {star_name}", fontsize=13)
-    ax.xaxis.set_minor_locator(ticker.AutoMinorLocator(4))
-    ax.yaxis.set_minor_locator(ticker.AutoMinorLocator(4))
-    ax.grid(True, which="major", alpha=0.3, linestyle="--")
-    ax.grid(True, which="minor", alpha=0.1, linestyle=":")
-    n_pts = len(jds)
-    span_min = (max(jds) - min(jds)) * 24 * 60
-    ax.text(0.98, 0.02,
-            f"{n_pts} pts · {span_min:.0f} min · MERR < {merr_max} mag",
-            transform=ax.transAxes, ha="right", va="bottom",
-            fontsize=8, color="gray")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close()
-    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1356,11 +1352,30 @@ class App(tk.Tk):
             for cs in self.comp_stars:
                 lc_cmd += f" -refwcs={cs['ra']:.6f},{cs['dec']:.6f}"
 
+        # Strip BAYERPAT before light_curve to work around a Siril 1.4.3 bug:
+        # copyfits(CP_FORMAT) clears date_obs in the CFA copy used for PSF fitting,
+        # so seq->imgparam[i].date_obs is never populated → JD axis shows frame indices.
+        # Without BAYERPAT, Siril skips the CFA copy and reads date_obs correctly.
+        bayer_stripped: dict[Path, tuple[int, str]] = {}
+        for fit_path in sorted(proc.glob(f"{stem}_*.fit")):
+            result = _fits_strip_keyword(fit_path, "BAYERPAT")
+            if result:
+                bayer_stripped[fit_path] = result
+        if bayer_stripped:
+            self._log(f"BAYERPAT stripped from {len(bayer_stripped)} frames (date_obs fix)")
+
         ok = self.runner.run_script(proc, [
             f'cd "{proc}"',
             f"setphot -aperture=10 -inner=20 -outer=30 -dyn_ratio=4.0 -gain={gain}",
             lc_cmd,
         ], "_s5_phot.ssf")
+
+        # Restore BAYERPAT regardless of outcome
+        for fit_path, (offset, val) in bayer_stripped.items():
+            _fits_restore_keyword(fit_path, "BAYERPAT", offset, val)
+        if bayer_stripped:
+            self._log("BAYERPAT restored")
+
         if not ok:
             self._done(False, "Step 5 failed (light_curve)"); return
 
@@ -1373,28 +1388,21 @@ class App(tk.Tk):
         out_csv = results_dir / f"{safe}_aavso.csv"
 
         if lc_dat.exists():
-            # Inject real Julian Dates from DATE-OBS headers before copying
-            exptime = get_gain_eadu  # reuse first-FITS scan; read EXPTIME separately
+            # Normalize .dat to absolute JD (handles all Siril output formats)
             try:
                 first_fit = next(iter(sorted(proc.glob(f"{stem}_*.fit"))))
                 exptime_s = float(read_fits_header(first_fit).get("EXPTIME", 20.0))
             except StopIteration:
                 exptime_s = 20.0
             if inject_jd_into_dat(lc_dat, seq_file, stem, seq_fixlen, proc, exptime_s):
-                self._log("JD timestamps injected from DATE-OBS headers ✓")
-            else:
-                self._log("WARNING: DATE-OBS not found — JD axis shows frame indices")
+                self._log("JD normalized to absolute JD ✓")
             shutil.copy2(lc_dat, out_dat)
 
-            # Generate our own plot with correct JD, units and filtering
+            # Copy Siril's PNG (now has correct JD axis thanks to BAYERPAT fix)
             out_png = results_dir / f"{safe}_light_curve.png"
-            if generate_light_curve_plot(out_dat, out_png, star["name"]):
-                self._log("Light curve plot generated ✓")
-            else:
-                # Fallback: copy Siril's raw PNG (frame-index x-axis)
-                png = proc / "light_curve.png"
-                if png.exists():
-                    shutil.copy2(png, out_png)
+            png = proc / "light_curve.png"
+            if png.exists():
+                shutil.copy2(png, out_png)
 
             rows = self._export_aavso(out_dat, out_csv, star["name"])
             n_valid = len(rows)
