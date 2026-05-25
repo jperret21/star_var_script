@@ -7,6 +7,9 @@ venv/
 dist/
 build/
 
+# Local notes (not for repo)
+TODO.md
+
 # Siril temp scripts
 _*.ssf
 
