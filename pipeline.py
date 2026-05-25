@@ -240,8 +240,13 @@ def query_vsx(ra: float, dec: float, radius_deg: float) -> list[dict]:
 
 
 def query_apass(ra: float, dec: float, target_mag: float,
-                radius_deg: float = 1.0, n: int = 6) -> list[dict]:
-    """Comparison stars from VizieR II/336/apass9."""
+                radius_deg: float = 1.0, n: int = 6,
+                dvmag: float = 2.0) -> list[dict]:
+    """Comparison stars from VizieR II/336/apass9.
+
+    dvmag: max magnitude difference from target. Use 3.5+ when target_mag
+    comes from VSX (which stores max brightness, often 1-2 mag brighter than mean).
+    """
     rows = _vizier_tsv(
         "II/336/apass9", ra, dec, radius_deg * 60,
         ["RAJ2000", "DEJ2000", "Vmag", "e_Vmag"],
@@ -256,7 +261,7 @@ def query_apass(ra: float, dec: float, target_mag: float,
             ra_c  = float(parts[0].strip())
             dec_c = float(parts[1].strip())
             vmag  = float(parts[2].strip())
-            if abs(vmag - target_mag) > 2.0:
+            if abs(vmag - target_mag) > dvmag:
                 continue
             sep = ((ra_c - ra) * 3600) ** 2 + ((dec_c - dec) * 3600) ** 2
             if sep < 25:  # < 5 arcsec from target
@@ -737,7 +742,9 @@ def run_pipeline(config: dict,
     comp_csv = proc / "comp_stars.csv"
     lc_cmd   = None
 
-    # Primary: findcompstars → -ninastars
+    # ── PRIMARY: findcompstars → -ninastars ───────────────────────────────────
+    # Requires a plate-solved ref frame loaded into gfit (has_wcs check in Siril).
+    # VSX names sometimes have a "V* " prefix that GCVS doesn't use — strip it.
     ref_fits_name = (
         f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
         if ref_img_num is not None else None
@@ -745,8 +752,9 @@ def run_pipeline(config: dict,
     if ref_fits_name and (proc / ref_fits_name).exists():
         if comp_csv.exists():
             comp_csv.unlink()
-        star_arg = star["name"].replace('"', '\\"')
-        on_log(f"findcompstars: querying APASS for {star['name']}…")
+        # Normalize name: strip "V* " prefix that VSX adds but GCVS/Siril doesn't use
+        star_arg = star["name"].removeprefix("V* ").replace('"', '\\"')
+        on_log(f"[PRIMARY] findcompstars '{star_arg}' (APASS, dvmag=3, emag=0.05)")
         runner.run_script(proc, [
             f'cd "{proc}"',
             f"load {ref_fits_name}",
@@ -755,24 +763,34 @@ def run_pipeline(config: dict,
         if comp_csv.exists() and comp_csv.stat().st_size > 50:
             kept = truncate_comp_csv(comp_csv, max(3, min(50, nstars)))
             lc_cmd = f"light_curve {registered} 0 -ninastars=comp_stars.csv"
-            on_log(f"Siril comparison stars ready: {kept} stars (findcompstars)")
+            on_log(f"[PRIMARY] OK — {kept} comp stars via findcompstars")
         else:
-            on_log("findcompstars produced no output — falling back to manual comp stars")
+            on_log(f"[PRIMARY] FAILED — '{star_arg}' not found in Siril catalog "
+                   f"(GCVS/SIMBAD name mismatch?) → trying fallback A")
 
-    # Fallback A: manual display-space pixel coords
-    # -at/-refat expect Siril display coords: display_x = fits_x - 0.5,
-    # display_y = NAXIS2 - fits_y + 0.5  (Y-flip + 0.5 offset, integer-rounded).
-    # -autoring is incompatible with -at mode in Siril 1.4.3.
+    # ── FALLBACK A: APASS via VizieR + pixel coords from WCS ─────────────────
+    # Uses dvmag=3.5 because VSX reports max brightness, not mean — the star may
+    # be 1-2 mag fainter than listed when observed near minimum.
     if lc_cmd is None and ref_img_num is not None:
         if not comp_stars:
-            on_log("findcompstars failed — auto-fetching APASS comparison stars…")
-            comp_stars = query_apass(star["ra"], star["dec"], star["mag"])
+            on_log(f"[FALLBACK A] querying APASS (radius=1.5°, dvmag=3.5) …")
+            comp_stars = query_apass(star["ra"], star["dec"], star["mag"],
+                                     radius_deg=1.5, n=nstars, dvmag=3.5)
+            if comp_stars:
+                on_log(f"[FALLBACK A] {len(comp_stars)} APASS comp stars found")
+            else:
+                on_log(f"[FALLBACK A] no APASS stars found "
+                       f"(target mag={star['mag']:.1f}, radius=1.5°) → trying fallback B")
+
     if lc_cmd is None and ref_img_num is not None and comp_stars:
         ref_fits = proc / f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
         ref_hdr  = read_fits_header(ref_fits)
         naxis2   = int(ref_hdr.get("NAXIS2", 0))
         tx, ty   = sky_to_pixel(star["ra"], star["dec"], ref_hdr)
-        if tx is not None and naxis2 > 0:
+
+        if tx is None or naxis2 == 0:
+            on_log("[FALLBACK A] WCS not available on ref frame → trying fallback B")
+        else:
             def _to_disp(fx, fy, n2=naxis2):
                 return round(fx - 0.5), round(n2 - fy + 0.5)
             ref_pix = []
@@ -785,12 +803,22 @@ def run_pipeline(config: dict,
                 lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
                 for rdx, rdy in ref_pix:
                     lc_cmd += f" -refat={rdx},{rdy}"
-                on_log(f"Fallback: display coords target ({tdx},{tdy}), "
+                on_log(f"[FALLBACK A] OK — target ({tdx},{tdy}), "
                        f"{len(ref_pix)} comp stars")
+            else:
+                on_log("[FALLBACK A] no comp stars project inside frame WCS "
+                       "→ trying fallback B")
 
-    # Fallback B: sky coordinates
+    # ── FALLBACK B: sky coordinates (-wcs/-refwcs) ────────────────────────────
+    # Last resort — less reliable, but avoids a silent failure.
     if lc_cmd is None:
-        on_log("WCS failed — using sky coordinates (-wcs)")
+        if not comp_stars:
+            on_done(False,
+                    f"No comparison stars found for '{star['name']}'.\n"
+                    "Check: internet connection for APASS query, target magnitude "
+                    "filter, or select a different star.")
+            return
+        on_log("[FALLBACK B] using sky coordinates (-wcs/-refwcs)")
         lc_cmd = (f"light_curve {registered} 0 "
                   f"-wcs={star['ra']:.6f},{star['dec']:.6f}")
         for cs in comp_stars:
