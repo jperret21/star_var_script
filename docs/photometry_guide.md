@@ -1,386 +1,119 @@
-# Variable Star Photometry — Technical Reference
+# Pipeline — Technical Notes
 
-Science and implementation details behind `seestar_varstar_siril.py`.
-
----
-
-## Contents
-
-1. [Differential photometry](#1-differential-photometry)
-2. [The LP filter and photometric bands](#2-the-lp-filter-and-photometric-bands)
-3. [Gain and photometric error bars](#3-gain-and-photometric-error-bars)
-4. [Channel selection: why channel 0](#4-channel-selection-why-channel-0)
-5. [Pipeline step by step](#5-pipeline-step-by-step)
-6. [Selecting comparison stars](#6-selecting-comparison-stars)
-7. [Apparent magnitude computation](#7-apparent-magnitude-computation)
-8. [FWHM extraction](#8-fwhm-extraction)
-9. [AAVSO Extended Format — field reference](#9-aavso-extended-format--field-reference)
-10. [Post-processing: varstar_postprod](#10-post-processing-varstar_postprod)
-11. [Siril commands reference](#11-siril-commands-reference-14-syntax)
-12. [Typical precision and observing strategy](#12-typical-precision-and-observing-strategy)
-13. [Troubleshooting](#13-troubleshooting)
+Implementation decisions, known bugs worked around, and algorithm specifics. Not a tutorial.
 
 ---
 
-## 1. Differential photometry
+## Version history
 
-Differential photometry measures the brightness of a target star **relative to comparison stars** in the same image. Because all stars are affected identically by atmospheric extinction, thin clouds, and varying seeing within a single frame, the differential magnitude is stable even under imperfect conditions:
-
-```
-diff_mag(target) = −2.5 × log10(flux_target / flux_ensemble)
-```
-
-where `flux_ensemble` is a weighted combination of all comparison stars.
-
-**What it cancels:**
-- First-order atmospheric extinction (same air mass for all stars)
-- Variable transparency (clouds, haze)
-- Detector gain variations frame-to-frame
-
-**What it does NOT cancel:**
-- Color-dependent extinction (differential color extinction) — minimized by choosing comparison stars with similar B−V color to the target
-- Instrumental color response differences (this is what a photometric transformation corrects)
-
-The pipeline uses Siril's ensemble method: `CNAME=ENSEMBLE`, `MTYPE=DIFF`.
+| Version | Key changes |
+|---------|-------------|
+| v0.1.5 | PRIMARY path via `findcompstars` + `-ninastars`; ensemble V_app; FWHM from `.seq` |
+| v0.1.4 | Frame safety margin raised to 200 px |
+| v0.1.3 | FALLBACK A/B comp star in-frame filtering |
+| v0.1.2 | Early frame check in step 5; removed Siril annotate |
+| v0.1.1 | WCS-based frame filtering |
+| v0.1.0 | Initial release |
 
 ---
 
-## 2. The LP filter and photometric bands
+## v0.1.5 — Algorithm details
 
-The Seestar S30 Pro ships with a built-in **light pollution (LP) filter** that blocks specific artificial lighting wavelengths (Na 589 nm, Hg 436/546 nm, etc.) while passing most of the visible spectrum.
+### Photometry path selection
 
-### Why this matters for photometry
+The pipeline tries three strategies in order. The one that succeeds is logged as `[PRIMARY]`, `[FALLBACK A]`, or `[FALLBACK B]`.
 
-Standard photometric catalogs (APASS, AAVSO) publish magnitudes in defined bands:
-
-| Band | λ_eff | Width | Notes |
-|------|-------|-------|-------|
-| Johnson B | 440 nm | 90 nm | Blue |
-| Johnson V | 550 nm | 90 nm | Green-yellow, most common |
-| Johnson R | 640 nm | 150 nm | Red |
-
-The LP filter's passband does not match any of these. Comparison star magnitudes from APASS are in V (or B, r, i) — applying them directly to LP-filtered measurements introduces a systematic offset that varies with the color of each star. For a cataclysmic variable (blue continuum + red companion) vs. G/K comp stars, this is typically ±0.2–0.5 mag.
-
-### AAVSO filter code: `CV`
-
-The closest AAVSO-recognized code for LP-filtered or unfiltered OSC observations is `CV` (Clear/Visual):
+**PRIMARY** — Siril `findcompstars` + `-ninastars`
 
 ```
-NOTES = seestar_s30pro|LP_filter_Seestar_S30Pro
-```
-
-**Consequence for submitted data:** AAVSO accepts `CV` observations. They are not directly comparable to V-band data without a color transformation coefficient (Tv). For variability monitoring (period, amplitude, event timing), this is generally sufficient.
-
----
-
-## 3. Gain and photometric error bars
-
-Siril's photometric error model combines:
-
-```
-σ_total² = σ_photon² + σ_sky² + σ_readout²
-
-σ_photon = √(flux / gain)           [photon shot noise]
-σ_sky     = A × σ_bg / √A_annulus   [background estimation]
-σ_readout = readnoise / gain         [detector electronics]
-```
-
-where `gain` is in electrons per ADU.
-
-### The GAIN=200 problem
-
-Seestar FITS headers contain `GAIN=200`. This is **not** the gain in e⁻/ADU — it is the camera gain setting (analogous to ISO 200). The Sony IMX585 at the Seestar's default mode runs at approximately **0.5–1.0 e⁻/ADU**.
-
-The pipeline reads `EGAIN` from the FITS header (the actual e⁻/ADU value). If absent, it falls back to **1.0 e⁻/ADU**, which is conservative and realistic for the IMX585.
-
----
-
-## 4. Channel selection: why channel 0
-
-After `register -2pass` + `seqapplyreg` on raw CFA (Bayer) frames, Siril outputs **1-layer mono FITS files**. The Bayer mosaic is preserved as a single-channel image.
-
-Siril's `light_curve` command uses a 0-based channel index:
-- `0` → the only channel in a 1-layer sequence ✓
-- `1` → would require a 3-channel RGB sequence ✗
-
-The pipeline uses `light_curve r_light_ 0`.
-
----
-
-## 5. Pipeline step by step
-
-### Step 0 — Calibration (optional)
-
-```
-link dark -out=masters      → dark_
-stack dark_ rej 3 3 -nonorm → master_dark.fit
-
-calibrate light_ -dark=masters/master_dark -flat=masters/master_flat
-  → pp_light_*.fit
-```
-
-Stacking uses 3-σ Winsorized sigma clipping. After calibration the active sequence is `pp_light_`; without it stays `light_`.
-
-### Steps 1+2 — Link + Register
-
-```
-link light -out=/path/to/process
-register light_ -2pass
-```
-
-`register -2pass` works offline using star-pattern matching. Writes transformation matrices to `light_.seq`.
-
-### Step 3 — seqapplyreg
-
-```
-seqapplyreg light_ -framing=max -filter-round=2.5k  →  r_light_*.fit
-```
-
-- `-framing=max`: maximum sky area (union of all frames)
-- `-filter-round=2.5k`: rejects worst frames by star elongation
-
-### Step 4 — seqplatesolve
-
-```
-seqplatesolve r_light_ -nocache -force -focal=160 -pixelsize=2.9 -radius=2.5
-```
-
-Each frame gets an independent plate solve against Gaia DR3. Writes full WCS headers (`CRVAL`, `CRPIX`, `CD` matrix) to every `r_light_*.fit`.
-
-**Why per-frame WCS?** After `seqapplyreg` with `-framing=max`, the reference frame WCS doesn't apply to the others without individual solutions.
-
-### Step 5 — setphot + light_curve
-
-```
-setphot -aperture=8 -inner=14 -outer=21 -gain=1.0
+findcompstars <target_name> -catalog=APASS -narrowband=0 -max_stars=N
+  → comp_stars.csv   (type, name, ra, dec, mag)
 light_curve r_light_ 0 -ninastars=comp_stars.csv
 ```
 
-**Siril 1.4.x known constraints:**
-- Pixel coordinates in `-at` mode must be **integers** — decimals cause `invalid arguments`
-- `-autoring` is incompatible with `-at` mode (Siril bug — use fixed `setphot` values instead)
+Siril handles star pixel lookup internally from the WCS headers. Requires WCS on every frame and at least 3 comp stars within the field.
+
+**FALLBACK A** — pixel coordinates via VizieR query
+
+```
+light_curve r_light_ 0 -at=x,y -refat=x1,y1 -refat=x2,y2 ...
+```
+
+Comp stars queried from VizieR APASS DR9 (`e_Vmag < 0.05`, `|ΔV| < 2.0`), converted to pixel via TAN projection from the reference frame WCS. Coordinates are rounded to integers (Siril 1.4.x rejects decimals).
+
+**FALLBACK B** — single nearest bright star
+
+Last resort. One comp star only — differential magnitude is noisier and any intrinsic variability of the comp star is undetected.
 
 ---
 
-## 6. Selecting comparison stars
+### Apparent magnitude (V_app)
 
-Comparison stars are fetched from **VizieR APASS DR9** (`II/336/apass9`) or via Siril's `findcompstars` command.
+```
+V_app = V_C + median(V_catalog[comp stars])
+```
 
-Automatic filters:
-- `e_Vmag < 0.05` — catalog uncertainty < 0.05 mag
-- `|Vmag − target_mag| < 2.0` — within 2 mag of target
-- Separation from target > 5 arcsec — avoids blending
+`V_C` is the raw Siril differential output (target − ensemble). `median(V_catalog)` is read from `comp_stars.csv` column 5 (Comp1 rows). This is mathematically the same as Siril's AAVSO formula but computed externally because `seqsetmag` is GUI-only and not scriptable.
 
-The pipeline selects up to 18 closest-in-magnitude stars.
+**LP filter systematic:** both target and comp stars go through the same filter, so V_C is unaffected. The systematic enters through `median(V_catalog)` because APASS magnitudes are in standard V. For a CV (blue + red) vs. G/K comp stars, expect ±0.2–0.5 mag absolute offset. Relative variations within a session are reliable.
 
 ---
 
-## 7. Apparent magnitude computation
+### FWHM extraction from `.seq`
 
-The pipeline computes an approximate apparent V magnitude using the APASS catalog magnitudes of the comparison stars:
+Siril's registration sequence file has one `R0` line per frame containing the registration star FWHM in pixels (x, y separately). These are produced by the star-detection step of `register -2pass` — not a PSF fit on the target, but a good seeing proxy.
 
 ```
-V_app = V_C + ensemble_V
+R0 <fwhm_x> <fwhm_y> <other fields...>
 ```
 
-where:
-- `V_C` is the differential magnitude from Siril's `light_curve` output
-- `ensemble_V` is the **median** V catalog magnitude of the comparison stars (read from `comp_stars.csv`)
+`R0` lines appear in the same order as the `I` (image) lines. The pipeline zips them 1:1, skips frames with `selected=0` or `fwhm_x ≤ 0`, reads `DATE-OBS` from each corresponding FITS header, converts to JD, and scales by plate scale (1.035 arcsec/px).
 
-This is mathematically equivalent to Siril's AAVSO calibration formula:
-```
-V_std = (V_ins_target − V_ins_comp) + V_catalog_comp
-```
-
-**Limitations:** Because an LP filter is used instead of a standard V filter, `V_app` carries an additional color-dependent systematic offset of ±0.2–0.5 mag vs. the true V magnitude. Relative variations within a session are unaffected.
-
-Output in `photometry.csv`:
-```csv
-# Ensemble V (APASS comp stars median): 12.284
-# V_app = V_C + ensemble_V
-JD,V_C,V_app,err
-```
+**Stem convention:** `registered.rstrip("_")` — e.g. `"r_light_"` → `"r_light"`. FITS filename is then `r_light_00012.fit` (stem + `_` + zero-padded index). If a frame is missing from disk (rejected by `seqapplyreg`), the I line still exists in the `.seq` with `selected=0`, so the zip alignment stays correct.
 
 ---
 
-## 8. FWHM extraction
+### Gain handling
 
-Per-frame seeing FWHM is extracted from Siril's registration sequence file (`.seq`).
+`get_gain_eadu()` tries headers in order: `EGAIN`, `EPERDN`, `GAIN_E`, `CCDGAIN`, then `GAIN`. Values accepted only if `0.05 < g < 30`. The Seestar writes `GAIN=200` (ISO-equivalent, not e⁻/ADU), which is rejected by this range check.
 
-The `.seq` file contains `R0` lines with registration star FWHM in pixels (x and y separately). These are correlated with the FITS frame timestamps (`DATE-OBS` header) and scaled by the plate scale (1.035 arcsec/px for the Seestar S30 Pro).
+**Current state:** always falls back to **1.0 e⁻/ADU**. The IMX585 at gain 200 is physically ~0.5–0.7 e⁻/ADU. Error bars are therefore ~20–40% wider than they should be, which is conservative and harmless for differential photometry.
 
-Output in `fwhm.csv`:
-```csv
-# FWHM per frame from Siril registration star detection
-# Plate scale: 1.0350 arcsec/px
-JD,FWHM_x_arcsec,FWHM_y_arcsec
-```
-
-Note: this is the registration star's FWHM (seeing proxy), not a PSF fit on the target star.
+**Fix when available:** the companion Seestar control app should write `EGAIN` with the real conversion factor into the FITS headers, and `get_gain_eadu()` will pick it up automatically.
 
 ---
 
-## 9. AAVSO Extended Format — field reference
+## Siril 1.4.x constraints and workarounds
 
-```csv
-#TYPE=EXTENDED
-#OBSCODE=XXXX
-#SOFTWARE=Siril+seestar_varstar_siril.py
-#FILTER=CV
-#DELIM=,
-#DATE=JD
-#OBSTYPE=CCD
-NAME,DATE,MAG,MERR,FILT,TRANS,MTYPE,CNAME,CMAG,KNAME,KMAG,AMASS,GROUP,CHART,NOTES
-```
-
-| Field | Value | Rationale |
-|-------|-------|-----------|
-| `FILT` | `CV` | LP filter is not a standard band; CV is correct for broadband/unfiltered |
-| `TRANS` | `NO` | No color transformation applied |
-| `MTYPE` | `DIFF` | Differential — relative to comparison ensemble |
-| `CNAME` | `ENSEMBLE` | Multiple comparison stars |
-| `CMAG` | `na` | Ensemble magnitude not reported as a single value |
-| `AMASS` | `na` | Airmass not computed (requires observer coordinates) |
-| `NOTES` | `LP_filter_Seestar_S30Pro` | Documents the filter |
-
-> **Before submitting:** replace `OBSCODE=XXXX` with your real code from [aavso.org/register](https://www.aavso.org/register).
+| Constraint | Workaround |
+|-----------|------------|
+| `-at` pixel coords must be integers | `round()` applied before building the command |
+| `-autoring` incompatible with `-at` | Fixed `setphot` values used instead |
+| `seqsetmag` is GUI-only, not scriptable | Ensemble V_app computed externally from `comp_stars.csv` |
+| `.ssf` parser does not strip quotes from `-out="path"` | Always use `-out=path` (unquoted) |
+| `seqpsf` in headless mode prints to console only, no file output | Not used; FWHM read from `.seq` instead |
+| `light_curve -wcs` can fail if WCS availability check fails on some frames | PRIMARY path uses `-ninastars` (sky coords handled internally by Siril); FALLBACK A uses `-at` (bypasses WCS check) |
 
 ---
 
-## 10. Post-processing: `varstar_postprod/`
+## Registration and alignment
 
-After the pipeline, use these tools to produce publication-quality figures — independently of Siril.
+`register -2pass` uses star-pattern matching (offline). The transform per frame is a **similarity** (translation + rotation + uniform scale) — no shear, no distortion correction.
 
-### `plot_lightcurve.py`
+`seqapplyreg -framing=max` pads frames to the union of all fields of view. This means the output frames are larger than the input. Stars near the border appear in fewer frames, which is why pixel coordinates outside the safety margin (200 px from each edge, v0.1.4+) are excluded from comp star selection.
 
-```bash
-python plot_lightcurve.py /path/to/results/StarName --bin 5 --sigma 3 --format both
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--bin` | 10 | Bin width in minutes |
-| `--sigma` | 3.0 | Sigma-clipping threshold (MAD-based) |
-| `--format` | both | `pdf`, `png`, or `both` |
-| `--periodogram` | off | Add Lomb-Scargle periodogram |
-| `--period` | — | Period (days) for phase-folded plot |
-| `--t0` | — | Reference epoch (JD) for phase fold |
-| `--no-diag` | off | Skip diagnostics figure |
-| `--out` | same as input | Output directory |
-
-Output files:
-- `light_curve_pub.pdf/png` — light curve with inverse-variance weighted bins
-- `diagnostics_pub.pdf/png` — error distribution and scatter quality
-- `periodogram_pub.pdf/png` — Lomb-Scargle period search
-- `phase_folded_pub.pdf/png` — if `--period` is given
-
-### `analysis.ipynb`
-
-Open with JupyterLab or VS Code. Edit the configuration cell:
-
-```python
-DATA_DIR = "/path/to/results/StarName"
-SIGMA    = 3.0
-BIN_MIN  = 10
-PERIOD   = None   # set to period in days to enable phase folding
-```
-
-Sections: light curve · diagnostics · summary statistics · Lomb-Scargle · phase fold · FWHM vs time · LaTeX table row.
+`-filter-round=2.5k` keeps the 2500 best frames by star elongation. On a typical Seestar session of 200–500 frames this has no effect (all kept), but protects against including wind-shake or satellite trail frames.
 
 ---
 
-## 11. Siril commands reference (1.4 syntax)
+## Plate scale
 
 ```
-link basename -out=directory
-    Create a numbered sequence from all FITS in current directory.
-    NOTE: -out= value must NOT be quoted in .ssf scripts.
-
-register sequence -2pass
-    Star-pattern matching registration. Offline, robust.
-
-seqapplyreg sequence -framing=max -filter-round=Nk
-    Apply registration transforms. -framing=max uses maximum field.
-
-calibrate sequence [-bias=file] [-dark=file] [-flat=file] [-cc=banding]
-    Apply calibration frames. -cc=banding corrects column banding (CMOS).
-
-stack sequence [type] [lo] [hi] [-nonorm | -norm=mul] [-out=name]
-    rej 3 3 = Winsorized sigma clipping 3σ. -nonorm for darks, -norm=mul for flats.
-
-seqplatesolve sequence -nocache -force -focal=mm -pixelsize=um -radius=deg
-    Per-frame plate solve using Gaia DR3 (online).
-
-setphot -aperture=px -inner=px -outer=px -gain=value
-    Configure aperture photometry. gain in e-/ADU.
-
-findcompstars target_name -catalog=APASS -maxmag=N -out=comp_stars.csv
-    Fetch APASS comparison stars around target.
-
-light_curve sequence channel [-ninastars=csv] [-at=x,y] [-refat=x,y ...]
-    Aperture photometry on every frame.
-    channel: 0 for 1-layer mono.
-    -ninastars: use a comp star CSV from findcompstars.
+plate_scale = 206.265 × pixel_size_µm / focal_length_mm
+            = 206.265 × 2.9 / 160
+            ≈ 3.74 arcsec/px   (raw Bayer pixel)
 ```
 
-Full reference: [siril.readthedocs.io/en/latest/Commands.html](https://siril.readthedocs.io/en/latest/Commands.html)
+After `seqapplyreg` the pixel scale is unchanged (Siril resamples to the same grid). The FWHM plate scale used for `.seq` → arcsec conversion is **1.035 arcsec/px** — this is the registered frame scale after the Seestar's internal preprocessing (the Seestar stacks 10s sub-exposures with slight drizzle, changing the effective pixel scale slightly).
 
----
-
-## 12. Typical precision and observing strategy
-
-### Expected precision with Seestar S30 Pro (30 mm aperture)
-
-| Target magnitude | Expected σ per frame | Notes |
-|-----------------|---------------------|-------|
-| < 10 mag | > 0.05 mag | Near saturation — shorten exposure |
-| 10–13 mag | 0.01–0.04 mag | Good regime |
-| 13–14 mag | 0.05–0.10 mag | Usable for large-amplitude variables |
-| > 14 mag | > 0.10 mag | Marginal — add calibration frames |
-
-Scintillation sets a hard floor of ~20–40 mmag on a 30 mm aperture regardless of target brightness. Exoplanet transit detection (< 10 mmag) is not feasible with this instrument.
-
-### Short-period variables (RR Lyrae, δ Scuti, eclipsing binaries)
-
-- Use raw 20s frames — don't stack
-- Cover at least 1–2 full periods
-- Cadence: one point every ~25s (frame + readout)
-
-### Long-period variables (Mira, SR, semi-regular)
-
-- Stack groups of 5–10 frames to reduce scatter
-- 1–3 measurements per night is sufficient
-- Use **"Photometry only"** on repeat nights
-
-### Observing tips for best precision
-
-- **Observe near meridian** — lowest airmass, minimum extinction and scintillation
-- **Good transparency** — avoid nights with haze or high humidity
-- **No LP filter** (if dark sky allows) — removes color systematics
-
----
-
-## 13. Troubleshooting
-
-Run `test_connections.py` from Siril first — it checks all APIs and the Siril connection.
-
-| Error | Cause | Fix |
-|-------|-------|-----|
-| `No sequence light_ found` | Path has spaces | Move session to a path without spaces |
-| `PSF cannot be computed on channel 1` | Sequence is 1-layer mono | Fixed: script uses channel 0 |
-| `plate solve had errors` | Too few stars or no internet | Ensure internet; try longer exposures |
-| `light_curve.dat not found` | Target outside field or no WCS | Check coordinates; verify plate solve |
-| `VSX: no results` | VizieR unreachable | Run `test_connections.py` |
-| `invalid arguments` in light_curve | Decimal pixel coordinates | Fixed: pipeline rounds to int |
-
----
-
-## References
-
-- [Siril documentation](https://siril.readthedocs.io/en/latest/)
-- [Siril photometry tutorial](https://siril.org/tutorials/photometry/)
-- [AAVSO Extended File Format](https://www.aavso.org/aavso-extended-file-format)
-- [AAVSO CCD photometry guide](https://www.aavso.org/ccd-photometry-guide)
-- [AAVSO Light Curve Generator](https://app.aavso.org/lcg/)
-- [VizieR VSX catalog](https://vizier.cds.unistra.fr/viz-bin/VizieR?-source=B/vsx/vsx)
-- [VizieR APASS DR9](https://vizier.cds.unistra.fr/viz-bin/VizieR?-source=II/336/apass9)
+> TODO: verify 1.035 empirically from a plate-solved frame (FITS CD matrix → arcsec/px).
