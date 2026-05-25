@@ -1,4 +1,4 @@
-"""Tests for sky_to_pixel (TAN gnomonic projection)."""
+"""Tests for sky_to_pixel and stars_in_frame."""
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import math
 import unittest
 
-from pipeline import sky_to_pixel
+from pipeline import sky_to_pixel, stars_in_frame
 
 
 def _cdelt_hdr(crval1, crval2, crpix1, crpix2, cdelt_deg):
@@ -100,6 +100,61 @@ class TestSkyToPixel(unittest.TestCase):
         _, py_minus = sky_to_pixel(180.0, -1.0, hdr)
         # Symmetric around CRPIX2
         self.assertAlmostEqual(py_plus + py_minus, 2 * 1920.0, places=3)
+
+
+class TestStarsInFrame(unittest.TestCase):
+
+    CDELT = TestSkyToPixel.SEESTAR_CDELT  # ~1.035 arcsec/px in degrees
+    CRVAL1 = 148.888
+    CRVAL2 = 69.065
+    CRPIX1 = 1080.0
+    CRPIX2 = 1920.0
+    W, H = 2160, 3840  # typical Seestar frame
+
+    def _hdr(self):
+        return _cdelt_hdr(self.CRVAL1, self.CRVAL2,
+                          self.CRPIX1, self.CRPIX2, self.CDELT)
+
+    def _star(self, ra, dec, name="S"):
+        return {"name": name, "ra": ra, "dec": dec, "mag": 12.0}
+
+    def test_center_star_included(self):
+        s = self._star(self.CRVAL1, self.CRVAL2)
+        result = stars_in_frame([s], self._hdr(), self.W, self.H)
+        self.assertEqual(len(result), 1)
+
+    def test_far_out_of_frame_excluded(self):
+        # 5 degrees away — well outside a 2.2×3.9° field
+        s = self._star(self.CRVAL1 + 5.0, self.CRVAL2)
+        result = stars_in_frame([s], self._hdr(), self.W, self.H)
+        self.assertEqual(len(result), 0)
+
+    def test_margin_excludes_edge_star(self):
+        # Place a star exactly on pixel (margin-1, CRPIX2) → should be excluded
+        margin = 50
+        # One pixel inside the margin from the left edge
+        cdelt = self.CDELT
+        delta_ra = (margin - 1 - self.CRPIX1) * (-cdelt) / math.cos(math.radians(self.CRVAL2))
+        s = self._star(self.CRVAL1 + delta_ra, self.CRVAL2)
+        result = stars_in_frame([s], self._hdr(), self.W, self.H, margin=margin)
+        self.assertEqual(len(result), 0)
+
+    def test_empty_input_returns_empty(self):
+        result = stars_in_frame([], self._hdr(), self.W, self.H)
+        self.assertEqual(result, [])
+
+    def test_no_wcs_skips_all(self):
+        # Without WCS keywords sky_to_pixel returns (None, None) → all excluded
+        s = self._star(self.CRVAL1, self.CRVAL2)
+        result = stars_in_frame([s], {}, self.W, self.H)
+        self.assertEqual(result, [])
+
+    def test_mixed_in_and_out(self):
+        center = self._star(self.CRVAL1, self.CRVAL2, "center")
+        far    = self._star(self.CRVAL1 + 5.0, self.CRVAL2, "far")
+        result = stars_in_frame([center, far], self._hdr(), self.W, self.H)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "center")
 
 
 if __name__ == "__main__":

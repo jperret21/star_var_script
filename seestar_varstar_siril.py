@@ -34,6 +34,9 @@ from pipeline import (  # noqa: E402
     SirilRunner,
     find_siril_cli,
     read_fits_header,
+    stars_in_frame,
+    find_siril_user_catalogue,
+    update_siril_catalogue,
     query_vsx,
     query_apass,
     run_pipeline,
@@ -100,13 +103,16 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self.minsize(980, 700)
 
-        self.session_dir:   Optional[Path]  = session_dir
-        self.field_ra:      float           = 0.0
-        self.field_dec:     float           = 0.0
-        self.all_stars:     list[dict]      = []
-        self.comp_stars:    list[dict]      = []
-        self.selected_star: Optional[dict]  = None
-        self.runner:        Optional[SirilRunner] = None
+        self.session_dir:    Optional[Path]  = session_dir
+        self.field_ra:       float           = 0.0
+        self.field_dec:      float           = 0.0
+        self.field_wcs_hdr:  dict            = {}
+        self.field_naxis1:   int             = 0
+        self.field_naxis2:   int             = 0
+        self.all_stars:      list[dict]      = []
+        self.comp_stars:     list[dict]      = []
+        self.selected_star:  Optional[dict]  = None
+        self.runner:         Optional[SirilRunner] = None
 
         self._build_ui()
         self._apply_ttk_style()
@@ -438,6 +444,7 @@ class App(tk.Tk):
         ra = dec = 0.0
         obj = ""
         n_frames = 0
+        h: dict = {}
         if stack:
             h = read_fits_header(stack)
             ra       = float(h.get("RA",       h.get("CRVAL1", 0)))
@@ -482,6 +489,7 @@ class App(tk.Tk):
             (proc / f"{seq}.seq").exists()
             for seq in ("r_light_", "r_pp_light_")
         )
+        hdr: dict = {}
         has_platesolved = False
         if has_registered:
             for seq in ("r_light_", "r_pp_light_"):
@@ -505,6 +513,16 @@ class App(tk.Tk):
             suggested = "Full pipeline (steps 1–5)"
 
         self.after(0, lambda s=suggested: self.start_from_var.set(s))
+
+        # Best available WCS for in-frame star filtering (plate-solved frame preferred)
+        if hdr.get("CRVAL1") and hdr.get("NAXIS1"):
+            self.field_wcs_hdr = hdr
+            self.field_naxis1 = int(float(hdr.get("NAXIS1", 0)))
+            self.field_naxis2 = int(float(hdr.get("NAXIS2", 0)))
+        elif h.get("CRVAL1") and h.get("NAXIS1"):
+            self.field_wcs_hdr = h
+            self.field_naxis1 = int(float(h.get("NAXIS1", 0)))
+            self.field_naxis2 = int(float(h.get("NAXIS2", 0)))
 
     # ── Table ─────────────────────────────────────────────────────────────────
 
@@ -594,12 +612,72 @@ class App(tk.Tk):
                 (((s["ra"] - self.field_ra) * 0.7071) ** 2
                  + (s["dec"] - self.field_dec) ** 2) ** 0.5, 3
             )
+
+        # Keep only stars that project inside the actual image frame
+        if self.field_wcs_hdr and self.field_naxis1 and self.field_naxis2:
+            filtered = stars_in_frame(stars, self.field_wcs_hdr,
+                                      self.field_naxis1, self.field_naxis2)
+            self._log(f"VSX: {len(stars)} in search area → "
+                      f"{len(filtered)} within image frame")
+            stars = filtered
+        else:
+            self._log(f"VSX: {len(stars)} found (no WCS yet — plate-solve for exact filtering)")
+
+        # Persist filtered list so it survives restart
+        if self.session_dir and stars:
+            csv_path = self.session_dir / "starsv.csv"
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["name", "ra", "dec", "mag", "var_type", "period"])
+                for s in stars:
+                    w.writerow([s["name"], s["ra"], s["dec"],
+                                 s.get("mag", 99), s.get("var_type", "?"),
+                                 s.get("period", "—")])
+
+        # Update Siril annotation catalogue and trigger overlay
+        cat_path = find_siril_user_catalogue()
+        if cat_path and stars:
+            n_new = update_siril_catalogue(stars, cat_path)
+            if n_new:
+                self._log(f"Siril catalogue: {n_new} new star(s) added → {cat_path.name}")
+            self._show_field_annotated()
+
         self.all_stars = sorted(stars, key=lambda s: s["dist"])
         self.after(0, lambda: (
             self._refresh_table(),
-            self._log(f"VSX: {len(stars)} variable stars found in field"),
+            self._log(f"VSX: {len(stars)} variable stars in field"),
             self._btn_state(True),
         ))
+
+    def _show_field_annotated(self):
+        """Load the stacked image in Siril's GUI and trigger the annotation overlay."""
+        if not self.session_dir or not self.runner:
+            return
+        session = self.session_dir
+        stack = None
+        for cand in ["process/lights.fit", "process/result.fit"]:
+            p = session / cand
+            if p.exists():
+                stack = p
+                break
+        if stack is None:
+            for p in session.glob("*_og.fit"):
+                stack = p
+                break
+        if stack is None:
+            return
+
+        iface = getattr(self.runner, "_iface", None)
+        if iface:
+            try:
+                iface.cmd("load", str(stack))
+                iface.cmd("annotate")
+                self._log("Siril: variable stars annotated in main window")
+            except Exception as e:
+                self._log(f"Siril annotate: {e}")
+        else:
+            self._log("Tip: in Siril open the stack and use "
+                      "Outils > Astrométrie > Annoter to see the stars")
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
 

@@ -11,12 +11,13 @@ import csv
 import datetime
 import math
 import os
+import platform
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # ── optional runtime deps ────────────────────────────────────────────────────
 
@@ -164,6 +165,92 @@ def sky_to_pixel(ra: float, dec: float, hdr: dict):
         return px, py
     except (KeyError, ValueError, ZeroDivisionError):
         return None, None
+
+
+def stars_in_frame(stars: list[dict], wcs_hdr: dict,
+                   naxis1: int, naxis2: int,
+                   margin: int = 50) -> list[dict]:
+    """Return only stars whose sky coords project inside the image frame.
+
+    margin: minimum pixel distance from any edge. Set to at least the outer
+    photometry ring (30 px) so apertures don't clip at the boundary.
+    """
+    inside = []
+    for star in stars:
+        px, py = sky_to_pixel(star["ra"], star["dec"], wcs_hdr)
+        if px is None:
+            continue
+        if (margin < px <= naxis1 - margin and
+                margin < py <= naxis2 - margin):
+            inside.append(star)
+    return inside
+
+
+def find_siril_user_catalogue() -> Optional[Path]:
+    """Return path to Siril's user-DSO-catalogue.csv, or None if not found."""
+    system = platform.system()
+    if system == "Darwin":
+        candidates = [
+            Path.home() / "Library/Application Support/org.siril.Siril/siril/catalogue/user-DSO-catalogue.csv",
+        ]
+    elif system == "Linux":
+        candidates = [
+            Path.home() / ".local/share/siril/catalogue/user-DSO-catalogue.csv",
+            Path.home() / ".siril/catalogue/user-DSO-catalogue.csv",
+        ]
+    else:  # Windows
+        appdata = Path(os.environ.get("APPDATA", Path.home()))
+        candidates = [appdata / "siril/catalogue/user-DSO-catalogue.csv"]
+
+    for p in candidates:
+        if p.parent.is_dir():
+            return p
+    return None
+
+
+def update_siril_catalogue(stars: list[dict], catalogue_path: Path) -> int:
+    """Append in-frame VSX stars to Siril's user DSO catalogue.
+
+    Skips stars already present (matched by name or alias, both with and
+    without the 'V* ' prefix that VSX sometimes adds).
+    Returns the number of new entries written.
+    """
+    existing: set[str] = set()
+    if catalogue_path.exists():
+        with open(catalogue_path, encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                for field in ("name", "alias"):
+                    v = row.get(field, "").strip()
+                    if v:
+                        existing.add(v)
+                        existing.add(v.removeprefix("V* "))
+                        existing.add(f"V* {v}")
+
+    new_stars = [
+        s for s in stars
+        if s["name"] not in existing
+        and s["name"].removeprefix("V* ") not in existing
+    ]
+    if not new_stars:
+        return 0
+
+    write_header = not catalogue_path.exists() or catalogue_path.stat().st_size == 0
+    with open(catalogue_path, "a", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["name", "ra", "dec", "pmra", "pmdec", "mag", "bmag", "alias"])
+        for star in new_stars:
+            w.writerow([
+                star["name"],
+                f"{star['ra']:.6f}",
+                f"{star['dec']:.6f}",
+                "",
+                "",
+                f"{star.get('mag', 99.0):.2f}",
+                "",
+                star.get("var_type", ""),
+            ])
+    return len(new_stars)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -785,28 +872,45 @@ def run_pipeline(config: dict,
     if lc_cmd is None and ref_img_num is not None and comp_stars:
         ref_fits = proc / f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
         ref_hdr  = read_fits_header(ref_fits)
+        naxis1   = int(ref_hdr.get("NAXIS1", 0))
         naxis2   = int(ref_hdr.get("NAXIS2", 0))
         tx, ty   = sky_to_pixel(star["ra"], star["dec"], ref_hdr)
 
-        if tx is None or naxis2 == 0:
+        if tx is None or naxis1 == 0 or naxis2 == 0:
             on_log("[FALLBACK A] WCS not available on ref frame → trying fallback B")
         else:
             def _to_disp(fx, fy, n2=naxis2):
                 return round(fx - 0.5), round(n2 - fy + 0.5)
+
+            tdx, tdy = _to_disp(tx, ty)
+
+            # Margin = outer ring + small buffer so PSF fit doesn't touch the edge
+            margin = 35
+            if not (margin < tdx < naxis1 - margin and
+                    margin < tdy < naxis2 - margin):
+                on_done(False,
+                        f"'{star['name']}' is outside the image frame "
+                        f"(display pos: {tdx},{tdy}; image: {naxis1}×{naxis2}).\n"
+                        "Select a star closer to the center of the field.")
+                return
+
             ref_pix = []
             for cs in comp_stars:
                 rx, ry = sky_to_pixel(cs["ra"], cs["dec"], ref_hdr)
                 if rx is not None:
-                    ref_pix.append(_to_disp(rx, ry))
+                    rdx, rdy = _to_disp(rx, ry)
+                    if (margin < rdx < naxis1 - margin and
+                            margin < rdy < naxis2 - margin):
+                        ref_pix.append((rdx, rdy))
+
             if ref_pix:
-                tdx, tdy = _to_disp(tx, ty)
                 lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
                 for rdx, rdy in ref_pix:
                     lc_cmd += f" -refat={rdx},{rdy}"
                 on_log(f"[FALLBACK A] OK — target ({tdx},{tdy}), "
-                       f"{len(ref_pix)} comp stars")
+                       f"{len(ref_pix)}/{len(comp_stars)} comp stars in frame")
             else:
-                on_log("[FALLBACK A] no comp stars project inside frame WCS "
+                on_log("[FALLBACK A] no comp stars project inside frame "
                        "→ trying fallback B")
 
     # ── FALLBACK B: sky coordinates (-wcs/-refwcs) ────────────────────────────
