@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Seestar S30 Pro — Variable Star Finder & Photometry
-====================================================
+Seestar S30 Pro — Variable Star Finder & Photometry  (UI entry point)
+======================================================================
 Run from Siril: Script > Run Script > seestar_varstar_siril.py
 
 Requirements:
   - Siril 1.4+ open, session folder set as working directory
+  - pipeline.py in the same directory as this script
   - Internet access for VizieR catalog queries
 
 Troubleshoot:  Script > Run Script > test_connections.py
@@ -14,11 +15,6 @@ Troubleshoot:  Script > Run Script > test_connections.py
 from __future__ import annotations
 
 import csv
-import datetime
-import math
-import os
-import shutil
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -26,501 +22,38 @@ from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from typing import Optional
 
-# ── sirilpy — available when launched from Siril Script menu ─────────────────
-try:
-    sys.path.insert(0, "/Applications/Siril.app/Contents/Resources/share/siril/python_module")
-    import sirilpy
-    from sirilpy import SirilInterface
-    HAS_SIRILPY = True
-except ImportError:
-    HAS_SIRILPY = False
+# Ensure pipeline.py (in the same folder) is importable when launched from Siril
+sys.path.insert(0, str(Path(__file__).parent))
 
-# ── requests — bundled in Siril, also available in venv ──────────────────────
-try:
-    import requests
-    HAS_REQUESTS = True
-except ImportError:
-    HAS_REQUESTS = False
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Seestar S30 Pro hardware profile (from actual FITS headers)
-# ─────────────────────────────────────────────────────────────────────────────
-SEESTAR = {
-    "focal":  160,    # mm  (FOCALLEN from FITS)
-    "pixsz":  2.9,    # µm  (XPIXSZ from FITS)
-    "fov_w":  2.2,    # deg width  (~2160px × 2.9µm / 160mm)
-    "fov_h":  3.9,    # deg height (~3840px × 2.9µm / 160mm)
-    # gain: read from FITS EGAIN header at runtime — GAIN=200 is ISO, not e-/ADU
-}
-
-VIZIER = "https://vizier.cds.unistra.fr/viz-bin/asu-tsv"
-
-# AAVSO filter codes + note for each option presented to the user
-# (code, extra_note)
-FILTER_OPTIONS: dict[str, tuple[str, str]] = {
-    "Clear — no filter (CV)":         ("CV",  ""),
-    "LP anti-pollution filter (CV)":  ("CV",  "LP_filter_Seestar_S30Pro"),
-    "V Johnson":                       ("V",   ""),
-    "B Johnson":                       ("B",   ""),
-    "R Johnson":                       ("R",   ""),
-    "I Johnson":                       ("I",   ""),
-    "Sloan r'":                        ("SRJ", ""),
-    "Sloan i'":                        ("SIJ", ""),
-}
+from pipeline import (  # noqa: E402
+    VERSION,
+    SEESTAR,
+    FILTER_OPTIONS,
+    HAS_SIRILPY,
+    HAS_REQUESTS,
+    SirilRunner,
+    find_siril_cli,
+    read_fits_header,
+    query_vsx,
+    query_apass,
+    run_pipeline,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pure-Python FITS header reader (no astropy)
+# Theme — equilux-inspired dark palette matching Siril's UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def read_fits_header(path: Path) -> dict:
-    """Read FITS keywords without astropy."""
-    header: dict = {}
-    try:
-        with open(path, "rb") as f:
-            while True:
-                block = f.read(2880)
-                if not block:
-                    break
-                for i in range(0, 2880, 80):
-                    card = block[i:i + 80].decode("ascii", errors="replace")
-                    if card.startswith("END"):
-                        return header
-                    if "=" in card[:10]:
-                        key = card[:8].strip()
-                        val = card[10:].split("/")[0].strip().strip("'").strip()
-                        try:
-                            header[key] = float(val)
-                        except ValueError:
-                            header[key] = val
-    except Exception:
-        pass
-    return header
-
-
-def _fits_strip_keyword(path: Path, keyword: str) -> Optional[tuple[int, str]]:
-    """Remove a FITS header keyword in-place. Returns (byte_offset, value) for restore."""
-    kw_bytes = keyword.upper().ljust(8, ' ').encode('ascii')
-    try:
-        with open(path, 'r+b') as f:
-            block_start = 0
-            while True:
-                block = f.read(2880)
-                if len(block) < 80:
-                    break
-                for i in range(0, len(block), 80):
-                    card = block[i:i+80]
-                    if card[:8] == kw_bytes:
-                        val = card[10:80].decode('ascii', errors='ignore')
-                        val = val.split('/')[0].strip().strip("'").strip()
-                        f.seek(block_start + i)
-                        f.write(b' ' * 80)
-                        return (block_start + i, val)
-                    if card[:3] == b'END' and (len(card) < 4 or card[3:4] in (b' ', b'\x00')):
-                        return None
-                block_start += 2880
-    except Exception:
-        pass
-    return None
-
-
-def _fits_restore_keyword(path: Path, keyword: str, offset: int, value: str) -> bool:
-    """Restore a FITS keyword card at the exact byte offset it was removed from."""
-    kw = keyword.upper().ljust(8, ' ')[:8]
-    card = f"{kw}= '{value:<8}'"
-    card_bytes = card.encode('ascii').ljust(80)[:80]
-    try:
-        with open(path, 'r+b') as f:
-            f.seek(offset)
-            f.write(card_bytes)
-        return True
-    except Exception:
-        return False
-
-
-def sky_to_pixel(ra: float, dec: float, hdr: dict):
-    """
-    TAN gnomonic projection (ignores SIP, which is sub-pixel at Seestar scale):
-    sky coordinates (J2000 degrees) → FITS pixel coordinates (1-based).
-    Handles both CD-matrix and CDELT+PC formats.
-    Returns (px, py) or (None, None) on failure.
-    """
-    try:
-        crval1 = float(hdr["CRVAL1"])
-        crval2 = float(hdr["CRVAL2"])
-        crpix1 = float(hdr["CRPIX1"])
-        crpix2 = float(hdr["CRPIX2"])
-        if "CD1_1" in hdr:
-            cd11 = float(hdr["CD1_1"])
-            cd12 = float(hdr["CD1_2"])
-            cd21 = float(hdr["CD2_1"])
-            cd22 = float(hdr["CD2_2"])
-        else:
-            cdelt1 = float(hdr["CDELT1"])
-            cdelt2 = float(hdr["CDELT2"])
-            cd11 = cdelt1 * float(hdr.get("PC1_1", 1.0))
-            cd12 = cdelt1 * float(hdr.get("PC1_2", 0.0))
-            cd21 = cdelt2 * float(hdr.get("PC2_1", 0.0))
-            cd22 = cdelt2 * float(hdr.get("PC2_2", 1.0))
-        ra0   = math.radians(crval1)
-        dec0  = math.radians(crval2)
-        ra_r  = math.radians(ra)
-        dec_r = math.radians(dec)
-        dra   = ra_r - ra0
-        denom = (math.sin(dec0) * math.sin(dec_r) +
-                 math.cos(dec0) * math.cos(dec_r) * math.cos(dra))
-        if abs(denom) < 1e-10:
-            return None, None
-        x = math.degrees(-math.cos(dec_r) * math.sin(dra) / denom)
-        y = math.degrees((math.cos(dec0) * math.sin(dec_r) -
-                          math.sin(dec0) * math.cos(dec_r) * math.cos(dra)) / denom)
-        det = cd11 * cd22 - cd12 * cd21
-        if abs(det) < 1e-20:
-            return None, None
-        px = crpix1 + (cd22 * x - cd12 * y) / det
-        py = crpix2 + (-cd21 * x + cd11 * y) / det
-        return px, py
-    except (KeyError, TypeError, ValueError, ZeroDivisionError):
-        return None, None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Catalog queries via VizieR HTTP (no astroquery)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _vizier_tsv(catalog: str, ra: float, dec: float,
-                radius_arcmin: float, columns: list[str],
-                filters: dict | None = None, max_rows: int = 500) -> list[list[str]]:
-    """
-    Query VizieR and return parsed data rows (skips comment/header lines).
-    Returns [] on any error.
-    """
-    if not HAS_REQUESTS:
-        return []
-    params: dict = {
-        "-source": catalog,
-        "-c": f"{ra:.6f} {dec:+.6f}",
-        "-c.r": str(radius_arcmin),
-        "-c.u": "arcmin",
-        "-out": ",".join(columns),
-        "-out.max": str(max_rows),
-    }
-    if filters:
-        params.update(filters)
-    try:
-        r = requests.get(VIZIER, params=params, timeout=20)
-        r.raise_for_status()
-        rows = []
-        header_skipped = 0
-        for line in r.text.splitlines():
-            if line.startswith("#") or not line.strip():
-                continue
-            if line.startswith("-"):
-                header_skipped = 0
-                continue
-            header_skipped += 1
-            if header_skipped <= 2:   # column names + units rows
-                continue
-            rows.append(line.split("\t"))
-        return rows
-    except Exception:
-        return []
-
-
-def query_vsx(ra: float, dec: float, radius_deg: float) -> list[dict]:
-    """Variable stars from VizieR B/vsx/vsx."""
-    radius_arcmin = radius_deg * 60
-    rows = _vizier_tsv(
-        "B/vsx/vsx", ra, dec, radius_arcmin,
-        ["Name", "Type", "Period", "max", "RAJ2000", "DEJ2000"],
-    )
-    stars = []
-    for parts in rows:
-        if len(parts) < 6:
-            continue
-        try:
-            name     = parts[0].strip()
-            var_type = parts[1].strip() or "?"
-            period   = parts[2].strip()
-            mag_str  = parts[3].strip()
-            ra_s     = parts[4].strip()
-            dec_s    = parts[5].strip()
-            if not ra_s or not dec_s:
-                continue
-            stars.append({
-                "name":     name,
-                "ra":       float(ra_s),
-                "dec":      float(dec_s),
-                "mag":      float(mag_str) if mag_str else 99.0,
-                "var_type": var_type,
-                "period":   f"{float(period):.4f} d" if period else "—",
-                "dist":     0.0,
-            })
-        except (ValueError, IndexError):
-            continue
-    return stars
-
-
-def query_apass(ra: float, dec: float, target_mag: float,
-                radius_deg: float = 1.0, n: int = 6) -> list[dict]:
-    """Comparison stars from VizieR II/336/apass9."""
-    rows = _vizier_tsv(
-        "II/336/apass9", ra, dec, radius_deg * 60,
-        ["RAJ2000", "DEJ2000", "Vmag", "e_Vmag"],
-        filters={"e_Vmag": "<0.05"},
-        max_rows=200,
-    )
-    comps = []
-    for parts in rows:
-        if len(parts) < 3:
-            continue
-        try:
-            ra_c  = float(parts[0].strip())
-            dec_c = float(parts[1].strip())
-            vmag  = float(parts[2].strip())
-            if abs(vmag - target_mag) > 2.0:
-                continue
-            # exclude if too close to target (< 5 arcsec)
-            sep = ((ra_c - ra) * 3600) ** 2 + ((dec_c - dec) * 3600) ** 2
-            if sep < 25:
-                continue
-            comps.append({"ra": ra_c, "dec": dec_c, "vmag": vmag})
-        except (ValueError, IndexError):
-            continue
-    comps.sort(key=lambda c: abs(c["vmag"] - target_mag))
-    return comps[:n]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Siril runner
-# ─────────────────────────────────────────────────────────────────────────────
-
-def find_siril_cli() -> str:
-    for c in ["siril-cli",
-              "/Applications/Siril.app/Contents/MacOS/siril-cli",
-              "/usr/local/bin/siril-cli",
-              "/opt/homebrew/bin/siril-cli"]:
-        if shutil.which(c):
-            return c
-    return ""
-
-
-class SirilRunner:
-    def __init__(self, log_cb=None):
-        self._log = log_cb or print
-        self._iface = None
-        if HAS_SIRILPY:
-            try:
-                self._iface = SirilInterface()
-                self._iface.connect()
-                self._log("Connected to Siril via sirilpy ✓")
-            except Exception as e:
-                self._log(f"sirilpy: {e} — using siril-cli")
-
-    def run_script(self, working_dir: Path, commands: list[str],
-                   name: str = "_phot.ssf") -> bool:
-        script = working_dir / name
-        script.write_text("requires 1.4\n" + "\n".join(commands) + "\n",
-                          encoding="utf-8")
-        cli = find_siril_cli()
-        if not cli:
-            self._log("ERROR: siril-cli not found. Install Siril 1.4+")
-            return False
-        self._log(f"→ {cli} -d {working_dir.name} -s {name}")
-        proc = subprocess.Popen(
-            [cli, "-d", str(working_dir), "-s", str(script)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        for line in proc.stdout:
-            self._log(line.rstrip())
-        proc.wait()
-        return proc.returncode == 0
-
-    def get_working_dir(self) -> Optional[Path]:
-        if self._iface:
-            try:
-                return Path(self._iface.get_wd())
-            except Exception:
-                pass
-        return Path(os.getcwd())
-
-
-def truncate_comp_csv(csv_path: Path, n: int) -> int:
-    """Keep only the first n Comp1 entries in a findcompstars CSV. Returns kept count."""
-    try:
-        lines = csv_path.read_text(encoding="utf-8").splitlines()
-        out, comp_kept = [], 0
-        for line in lines:
-            if line.startswith("Comp1,") and comp_kept >= n:
-                continue
-            if line.startswith("Comp1,"):
-                comp_kept += 1
-            out.append(line)
-        csv_path.write_text("\n".join(out) + "\n", encoding="utf-8")
-        return comp_kept
-    except Exception:
-        return 0
-
-
-def dateobs_to_jd(date_str: str) -> Optional[float]:
-    """Convert a FITS DATE-OBS string (ISO 8601) to Julian Date (mid-exposure not applied)."""
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
-        try:
-            dt = datetime.datetime.strptime(date_str.strip(), fmt)
-            delta = dt - datetime.datetime(2000, 1, 1, 12, 0, 0)
-            return 2451545.0 + delta.total_seconds() / 86400.0
-        except ValueError:
-            continue
-    return None
-
-
-def inject_jd_into_dat(dat_path: Path, seq_path: Path,
-                       stem: str, fixlen: int, proc: Path,
-                       exptime_s: float = 20.0) -> bool:
-    """Normalize light_curve.dat to absolute JD regardless of Siril's output format.
-
-    Siril 1.4.3 outputs three possible formats depending on whether date_obs was
-    populated in the sequence:
-      - '#JD_UT (+ 0)' + frame indices 1,2,3…  → inject JD from FITS DATE-OBS
-      - '#JD_UT (+ N)' + fractional offsets     → add N to convert to absolute JD
-      - '#JD_UT'        + absolute JD already   → already correct, no-op
-
-    Returns True if file was modified.
-    """
-    try:
-        text = dat_path.read_text(encoding="utf-8")
-        lines = text.splitlines()
-    except Exception:
-        return False
-
-    # Parse julian0 from the first '#JD_UT' header line
-    julian0 = None
-    for line in lines:
-        if line.startswith("#JD_UT"):
-            # '#JD_UT (+ 2461161)' or '#JD_UT (+ 0)' or '#JD_UT'
-            if "(+" in line:
-                try:
-                    julian0 = int(line.split("(+")[1].split(")")[0].strip())
-                except (ValueError, IndexError):
-                    julian0 = 0
-            else:
-                julian0 = None  # already absolute JD
-            break
-
-    if julian0 is None:
-        return False  # already in absolute JD format, nothing to do
-
-    out: list[str] = []
-
-    if julian0 > 2_400_000:
-        # Correct Siril output: fractional day offsets from julian0
-        for line in lines:
-            if line.startswith("#JD_UT"):
-                out.append("#JD_UT")
-                continue
-            if line.startswith("#"):
-                out.append(line)
-                continue
-            parts = line.split()
-            if parts:
-                try:
-                    offset = float(parts[0])
-                    if offset < 10:  # fractional offset, not already absolute
-                        parts[0] = f"{julian0 + offset:.6f}"
-                except (ValueError, IndexError):
-                    pass
-            out.append(" ".join(parts))
-        dat_path.write_text("\n".join(out) + "\n", encoding="utf-8")
-        return True
-
-    # julian0 == 0: frame indices → inject from FITS DATE-OBS
-    selected_imgs: list[int] = []
-    try:
-        with open(seq_path) as fh:
-            for line in fh:
-                if line.startswith("I "):
-                    parts = line.split()
-                    img_num, flag = int(parts[1]), int(parts[2])
-                    if flag == 1:
-                        selected_imgs.append(img_num)
-    except Exception:
-        return False
-
-    jd_map: dict[int, float] = {}
-    half_exp = exptime_s / 86400.0 / 2.0
-    for idx, img_num in enumerate(selected_imgs, start=1):
-        fit_path = proc / f"{stem}_{img_num:0{fixlen}d}.fit"
-        hdr = read_fits_header(fit_path)
-        date_str = str(hdr.get("DATE-OBS", ""))
-        if date_str:
-            jd = dateobs_to_jd(date_str)
-            if jd is not None:
-                jd_map[idx] = jd + half_exp
-
-    if not jd_map:
-        return False
-
-    for line in lines:
-        if line.startswith("#JD_UT"):
-            out.append("#JD_UT")
-            continue
-        if line.startswith("#"):
-            out.append(line)
-            continue
-        parts = line.split()
-        if parts:
-            try:
-                idx = round(float(parts[0]))
-                if idx in jd_map:
-                    parts[0] = f"{jd_map[idx]:.6f}"
-            except (ValueError, KeyError):
-                pass
-        out.append(" ".join(parts))
-    dat_path.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return True
-
-
-def get_gain_eadu(lights_dir: Path) -> float:
-    """Read real gain in e-/ADU from the first FITS file in lights/.
-    GAIN=200 on a Seestar is ISO-equivalent, not e-/ADU.
-    EGAIN (if present) is the actual conversion factor.
-    Returns 1.0 as a safe fallback for modern CMOS if nothing found."""
-    for fit in sorted(lights_dir.glob("*.fit"))[:1]:
-        hdr = read_fits_header(fit)
-        for key in ("EGAIN", "EPERDN", "GAIN_E", "CCDGAIN"):
-            v = hdr.get(key)
-            if v is not None:
-                try:
-                    g = float(v)
-                    if 0.05 < g < 30:   # realistic e-/ADU range
-                        return round(g, 3)
-                except (ValueError, TypeError):
-                    pass
-        # GAIN keyword: only trust it if it's in e-/ADU range
-        v = hdr.get("GAIN")
-        if v is not None:
-            try:
-                g = float(v)
-                if 0.05 < g < 30:
-                    return round(g, 3)
-            except (ValueError, TypeError):
-                pass
-    return 1.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Theme
-# ─────────────────────────────────────────────────────────────────────────────
-
-BG      = "#2d2d2d"   # equilux bg_color (Siril dark theme)
-BG2     = "#1f1f1f"   # equilux dark_bg_color
-SURFACE = "#3c3c3c"   # equilux base_color (buttons, raised areas)
-BORDER  = "#484848"   # borders / dividers
-FG      = "#dedede"   # equilux fg_color
-FG2     = "#9a9a9a"   # secondary / dimmed text
-BLUE    = "#5294e2"   # equilux selected_bg_color (accent)
-CYAN    = "#4eb3c9"   # info / coordinate values
-GREEN   = "#7ab648"   # success
-RED     = "#d45c6e"   # error / target star
-YELLOW  = "#c89030"   # warnings / field info
+BG      = "#2d2d2d"
+BG2     = "#1f1f1f"
+SURFACE = "#3c3c3c"
+BORDER  = "#484848"
+FG      = "#dedede"
+FG2     = "#9a9a9a"
+BLUE    = "#5294e2"
+CYAN    = "#4eb3c9"
+GREEN   = "#7ab648"
+RED     = "#d45c6e"
+YELLOW  = "#c89030"
 MONO    = ("Menlo", "Courier New", "monospace")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -563,7 +96,7 @@ class DarkButton(tk.Label):
 class App(tk.Tk):
     def __init__(self, session_dir: Optional[Path] = None):
         super().__init__()
-        self.title("Seestar S30 Pro — Variable Star Photometry")
+        self.title(f"Seestar S30 Pro — Variable Star Photometry  v{VERSION}")
         self.configure(bg=BG)
         self.minsize(980, 700)
 
@@ -582,16 +115,14 @@ class App(tk.Tk):
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # ── Header ──
         hdr = tk.Label(self,
-                       text="  Seestar S30 Pro — Variable Star Finder & Photometry",
+                       text=f"  Seestar S30 Pro — Variable Star Finder & Photometry  v{VERSION}",
                        bg=BG, fg=BLUE,
                        font=("Helvetica", 15, "bold"), anchor="w")
         hdr.pack(fill="x", padx=12, pady=(12, 2))
 
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=12)
 
-        # ── Session row ──
         row = self._row(self)
         row.pack(fill="x", padx=12, pady=6)
         tk.Label(row, text="Session:", bg=BG, fg=FG2,
@@ -605,7 +136,6 @@ class App(tk.Tk):
         self._button(row, "Browse…",  self._browse).pack(side="left", padx=3)
         self._button(row, "Load",     self._load_session).pack(side="left")
 
-        # ── Field info ──
         info = self._row(self)
         info.pack(fill="x", padx=12, pady=(0, 4))
         self.lbl_field = tk.Label(info, text="Field: —", bg=BG, fg=YELLOW,
@@ -617,7 +147,6 @@ class App(tk.Tk):
 
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=12)
 
-        # ── Paned layout ──
         paned = tk.PanedWindow(self, orient="horizontal",
                                bg=BORDER, sashwidth=4, sashrelief="flat")
         paned.pack(fill="both", expand=True, padx=12, pady=8)
@@ -680,7 +209,6 @@ class App(tk.Tk):
         right = tk.Frame(paned, bg=BG)
         paned.add(right, minsize=380)
 
-        # Target card
         card = tk.LabelFrame(right, text=" Selected target ",
                              bg=BG, fg=BLUE, font=("Helvetica", 11, "bold"),
                              relief="solid", bd=1, padx=8, pady=6)
@@ -696,7 +224,6 @@ class App(tk.Tk):
                                   font=("Helvetica", 10), anchor="w")
         self.lbl_coord.pack(fill="x")
 
-        # ── Observation settings ──────────────────────────────────────────────
         obs_card = tk.LabelFrame(right, text=" Observation settings ",
                                  bg=BG, fg=BLUE, font=("Helvetica", 11, "bold"),
                                  relief="solid", bd=1, padx=8, pady=6)
@@ -739,7 +266,6 @@ class App(tk.Tk):
         tk.Label(nstars_row, text="(3–19, Siril max=19)", bg=BG, fg=FG2,
                  font=("Helvetica", 10)).pack(side="left")
 
-        # ── Calibration frames ────────────────────────────────────────────────
         cal_card = tk.LabelFrame(right, text=" Calibration frames  (optional) ",
                                  bg=BG, fg=BLUE, font=("Helvetica", 11, "bold"),
                                  relief="solid", bd=1, padx=8, pady=6)
@@ -763,7 +289,6 @@ class App(tk.Tk):
             self._button(row, "Browse…",
                          lambda v=var: self._browse_calib(v)).pack(side="left")
 
-        # Run button — starts disabled (dark), turns bright green when a target is selected
         self.run_btn = DarkButton(
             right,
             text="▶   Prepare frames & Generate light curve",
@@ -777,7 +302,6 @@ class App(tk.Tk):
         )
         self.run_btn.pack(fill="x", pady=8)
 
-        # Progress
         self.prog_var = tk.IntVar()
         prog = ttk.Progressbar(right, variable=self.prog_var, maximum=100,
                                style="Green.Horizontal.TProgressbar")
@@ -786,7 +310,6 @@ class App(tk.Tk):
                                  font=("Helvetica", 11), anchor="w")
         self.lbl_prog.pack(fill="x")
 
-        # Siril log — normal state so text is selectable and copyable
         log_card = tk.LabelFrame(right, text=" Siril log  (select & copy with Cmd+C) ",
                                  bg=BG, fg=BLUE, font=("Helvetica", 11, "bold"),
                                  relief="solid", bd=1)
@@ -799,7 +322,7 @@ class App(tk.Tk):
         self.log = tk.Text(log_frame, bg=BG2, fg=FG2,
                            font=(MONO[0], 10),
                            relief="flat", wrap="none",
-                           state="normal",     # stays normal → fully selectable
+                           state="normal",
                            height=10, yscrollcommand=log_sb.set)
         self.log.pack(side="left", fill="both", expand=True)
         log_sb.configure(command=self.log.yview)
@@ -859,7 +382,6 @@ class App(tk.Tk):
             status, color = "✗ siril-cli not found", RED
         self.after(0, lambda: self.lbl_siril.configure(text=status, fg=color))
 
-        # Auto-detect session
         if self.session_dir is None:
             wd = self.runner.get_working_dir()
             if wd and (wd / "lights").is_dir():
@@ -927,7 +449,6 @@ class App(tk.Tk):
         info = f"{obj}  ·  RA {ra:.4f}°  Dec {dec:+.4f}°  ·  {n_frames} stacked frames"
         self.after(0, lambda: self.lbl_field.configure(text=f"Field: {info}"))
 
-        # Load starsv.csv
         stars: list[dict] = []
         csv_path = session / "starsv.csv"
         if csv_path.exists():
@@ -956,7 +477,6 @@ class App(tk.Tk):
         self.all_stars = stars
         self.after(0, self._refresh_table)
 
-        # Auto-select best start point based on what's already done
         proc = session / "process"
         has_registered = any(
             (proc / f"{seq}.seq").exists()
@@ -978,8 +498,6 @@ class App(tk.Tk):
         if has_platesolved and has_lc:
             suggested = "Photometry only (step 5)"
         elif has_platesolved and not has_lc:
-            # Plate solve done but photometry failed — most likely a framing/drift
-            # issue in seqapplyreg; re-run from step 3 with -framing=cog
             suggested = "Apply reg + plate solve (steps 3–5)"
         elif has_registered:
             suggested = "Plate solve only (step 4–5)"
@@ -1093,376 +611,33 @@ class App(tk.Tk):
         self.log.delete("1.0", "end")
         threading.Thread(target=self._pipeline_bg, daemon=True).start()
 
+    def _get_start_step(self) -> int:
+        label = self.start_from_var.get()
+        if "step 5" in label or "Photometry" in label:
+            return 5
+        if "step 4" in label or "Plate solve" in label:
+            return 4
+        if "step 3" in label or "Apply reg" in label:
+            return 3
+        return 1
+
     def _pipeline_bg(self):
-        session = self.session_dir
-        proc    = session / "process"
-        lights  = session / "lights"
-        masters = proc / "masters"
-        proc.mkdir(exist_ok=True)
-
-        star  = self.selected_star
-        focal = SEESTAR["focal"]
-        pixsz = SEESTAR["pixsz"]
-        gain  = get_gain_eadu(lights)
-        self._log(f"Gain: {gain} e-/ADU")
-
-        # Determine which steps to run
-        start_label = self.start_from_var.get()
-        if "step 5" in start_label or "Photometry" in start_label:
-            start_step = 5
-        elif "step 4" in start_label or "Plate solve" in start_label:
-            start_step = 4
-        elif "step 3" in start_label or "Apply reg" in start_label:
-            start_step = 3
-        else:
-            start_step = 1
-
-        # ─── Jump to step 3/4/5 — detect existing registered sequence ──────
-        if start_step == 3:
-            # Need light_.seq from the register step
-            for candidate in ("pp_light_", "light_"):
-                if (proc / f"{candidate}.seq").exists():
-                    seq = candidate
-                    break
-            else:
-                self._done(False,
-                    f"No registered sequence (light_.seq) found in {proc.name}/.\n"
-                    "Run the full pipeline first (steps 1–5)."); return
-            registered = f"r_{seq}"
-
-        if start_step >= 4:
-            for candidate in ("r_pp_light_", "r_light_"):
-                if (proc / f"{candidate}.seq").exists():
-                    registered = candidate
-                    break
-            else:
-                self._done(False,
-                    f"No registered sequence found in {proc.name}/.\n"
-                    "Run the full pipeline first (steps 1–5)."); return
-            self._log(f"Resuming from step {start_step} — sequence: {registered}")
-
-        # ─── Steps 0–3 (only when starting from step 1) ──────────────────
-        if start_step == 1:
-            dark_dir = Path(self.dark_var.get()) if self.dark_var.get().strip() else None
-            flat_dir = Path(self.flat_var.get()) if self.flat_var.get().strip() else None
-            bias_dir = Path(self.bias_var.get()) if self.bias_var.get().strip() else None
-            has_calib = any([dark_dir, flat_dir, bias_dir])
-
-            # Cleanup: remove misplaced directory from previous run with quoted -out
-            bad_out = lights / f'"{proc}"'
-            if bad_out.exists():
-                shutil.rmtree(bad_out, ignore_errors=True)
-                self._log("Cleaned up misplaced output directory from a previous run.")
-
-            # Step 0 (optional): stack calibration masters + calibrate lights
-            if has_calib:
-                masters.mkdir(exist_ok=True)
-                self._prog(5, "Building calibration masters…")
-                self._log("─── Step 0: calibration frames ───")
-                calib_cmds = []
-                for kind, src in [("dark", dark_dir), ("flat", flat_dir), ("bias", bias_dir)]:
-                    if src is None:
-                        continue
-                    norm = "-nonorm" if kind in ("dark", "bias") else "-norm=mul"
-                    calib_cmds += [
-                        f'cd "{src}"',
-                        f'link {kind} -out={masters}',  # no quotes: Siril takes them literally
-                        f'cd "{masters}"',
-                        f'stack {kind}_ rej 3 3 {norm} -out=master_{kind}',
-                    ]
-                    self._log(f"  → stacking {kind}s from {src.name}/")
-                cal_flags = " ".join(
-                    f"-{k}=masters/master_{k}"
-                    for k, d in [("bias", bias_dir), ("dark", dark_dir), ("flat", flat_dir)]
-                    if d is not None
-                )
-                calib_cmds += [f'cd "{proc}"', f"calibrate light_ {cal_flags} -cc=banding"]
-                ok = self.runner.run_script(proc, calib_cmds, "_s0_calibrate.ssf")
-                if not ok:
-                    self._done(False, "Step 0 failed (calibration)"); return
-                seq = "pp_light_"
-            else:
-                self._log("No calibration frames — proceeding with raw lights.")
-                seq = "light_"
-
-            # Steps 1+2: link + register in the same siril-cli session
-            # IMPORTANT: -out= path must NOT be quoted — Siril parses quotes literally
-            self._prog(15, "Linking frames & computing registration…")
-            self._log("─── Step 1: link lights → sequence ───")
-            self._log("─── Step 2: register -2pass ───")
-            ok = self.runner.run_script(proc, [
-                f'cd "{lights}"',
-                f'link light -out={proc}',
-                f'cd "{proc}"',
-                f"register {seq} -2pass",
-            ], "_s12_link_register.ssf")
-            if not ok:
-                self._done(False, "Step 1/2 failed (link / register)"); return
-
-            # Step 3: apply registration
-            self._prog(45, "Aligning frames…")
-            self._log("─── Step 3: seqapplyreg ───")
-            ok = self.runner.run_script(proc, [
-                f'cd "{proc}"',
-                # -framing=cog: centers output on gravity center of all frames,
-                # keeping stored registration shifts small → avoids light_curve
-                # "heavy drift" failure that occurs with -framing=max
-                f"seqapplyreg {seq} -framing=cog -filter-round=2.5k",
-            ], "_s3_applyreg.ssf")
-            if not ok:
-                self._done(False, "Step 3 failed (seqapplyreg)"); return
-
-            registered = f"r_{seq}"
-
-        if start_step == 3:
-            # Came here from "Apply reg + plate solve (steps 3–5)"
-            self._prog(45, "Aligning frames…")
-            self._log("─── Step 3: seqapplyreg ───")
-            ok = self.runner.run_script(proc, [
-                f'cd "{proc}"',
-                f"seqapplyreg {seq} -framing=cog -filter-round=2.5k",
-            ], "_s3_applyreg.ssf")
-            if not ok:
-                self._done(False, "Step 3 failed (seqapplyreg)"); return
-
-        # ─── Step 4: plate solve (skippable) ─────────────────────────────
-        if start_step <= 4:
-            self._prog(65, "Plate solving registered frames…")
-            self._log("─── Step 4: seqplatesolve ───")
-            disto = proc / "ps_distortion"
-            disto_arg = "-disto=ps_distortion" if disto.is_dir() else ""
-            ok = self.runner.run_script(proc, [
-                f'cd "{proc}"',
-                f"seqplatesolve {registered} -nocache -force "
-                f"-focal={focal} -pixelsize={pixsz} -radius=2.5 {disto_arg}".strip(),
-            ], "_s4_platesolve.ssf")
-            if not ok:
-                self._log("WARNING: plate solve had errors — continuing")
-
-        # ── Step 5: clean stale files, resolve reference frame ───────────────
-        self._prog(82, "Checking sequence integrity…")
-
-        # Parse the .seq S-line to find the reference frame image number.
-        # S-line: S 'name' start nb_images nb_selected fixed_len ref_idx version ...
-        # ref_idx is a 0-based index into the I-lines list.
-        seq_file  = proc / f"{registered}.seq"
-        stem      = registered.rstrip("_")
-        seq_fixlen  = 4
-        seq_ref_idx = None          # 0-based index in I-lines
-        img_entries: list[tuple[int, int]] = []   # (img_num, 1-based rank)
-        try:
-            with open(seq_file) as fh:
-                rank = 0
-                for line in fh:
-                    if line.startswith("S "):
-                        parts = line.split()
-                        seq_fixlen  = int(parts[5])
-                        seq_ref_idx = int(parts[6])
-                    elif line.startswith("I "):
-                        rank += 1
-                        img_entries.append((int(line.split()[1]), rank))
-        except Exception:
-            pass
-
-        # Remove stale .fit files no longer in the .seq
-        if img_entries:
-            valid_nums = {n for n, _ in img_entries}
-            for f in sorted(proc.glob(f"{stem}_*.fit")):
-                try:
-                    num = int(f.stem[len(stem)+1:])
-                    if num not in valid_nums:
-                        self._log(f"Removing stale frame {f.name}")
-                        f.unlink()
-                except (ValueError, OSError):
-                    pass
-
-        ref_img_num = None
-        if seq_ref_idx is not None and seq_ref_idx < len(img_entries):
-            ref_img_num = img_entries[seq_ref_idx][0]
-
-        self._prog(85, "Aperture photometry…")
-        self._log("─── Step 5: setphot + light_curve ───")
-
-        comp_csv = proc / "comp_stars.csv"
-        lc_cmd   = None
-
-        # Primary: findcompstars → -ninastars -autoring.
-        # findcompstars queries APASS catalog, filters variable stars from GCVS,
-        # and writes a NINA-format CSV. light_curve -ninastars handles all
-        # coordinate conversion internally via the sequence's WCS.
-        # Requires a plate-solved reference frame loaded into gfit.
-        ref_fits_name = (
-            f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
-            if ref_img_num is not None else None
-        )
-        if ref_fits_name and (proc / ref_fits_name).exists():
-            if comp_csv.exists():
-                comp_csv.unlink()
-            star_arg = star["name"].replace('"', '\\"')
-            self._log(f"findcompstars: querying APASS for {star['name']}…")
-            self.runner.run_script(proc, [
-                f'cd "{proc}"',
-                f"load {ref_fits_name}",
-                f'findcompstars "{star_arg}" -narrow -dvmag=3 -emag=0.05 -catalog=apass -out=comp_stars.csv',
-            ], "_s5a_findcomp.ssf")
-            if comp_csv.exists() and comp_csv.stat().st_size > 50:
-                n = max(3, min(50, self.nstars_var.get()))
-                kept = truncate_comp_csv(comp_csv, n)
-                lc_cmd = f"light_curve {registered} 0 -ninastars=comp_stars.csv"
-                self._log(f"Siril comparison stars ready: {kept} stars (findcompstars)")
-            else:
-                self._log("findcompstars produced no output — falling back to manual comp stars")
-
-        # Fallback A: manual display-space pixel coords.
-        # -at/-refat expect Siril display coords: display_x = fits_x - 0.5,
-        # display_y = NAXIS2 - fits_y + 0.5  (Y-flip + 0.5 offset, integer-rounded).
-        # -autoring is incompatible with -at mode in Siril 1.4.3.
-        if lc_cmd is None and ref_img_num is not None:
-            if not self.comp_stars:
-                self._log("findcompstars failed — auto-fetching APASS comparison stars…")
-                self.comp_stars = query_apass(star["ra"], star["dec"], star["mag"])
-        if lc_cmd is None and ref_img_num is not None and self.comp_stars:
-            ref_fits = proc / f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
-            ref_hdr  = read_fits_header(ref_fits)
-            naxis2   = int(ref_hdr.get("NAXIS2", 0))
-            tx, ty   = sky_to_pixel(star["ra"], star["dec"], ref_hdr)
-            if tx is not None and naxis2 > 0:
-                def _to_disp(fx, fy, n2=naxis2):
-                    return round(fx - 0.5), round(n2 - fy + 0.5)
-                ref_pix = []
-                for cs in self.comp_stars:
-                    rx, ry = sky_to_pixel(cs["ra"], cs["dec"], ref_hdr)
-                    if rx is not None:
-                        ref_pix.append(_to_disp(rx, ry))
-                if ref_pix:
-                    tdx, tdy = _to_disp(tx, ty)
-                    lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
-                    for rdx, rdy in ref_pix:
-                        lc_cmd += f" -refat={rdx},{rdy}"
-                    self._log(
-                        f"Fallback: display coords target ({tdx},{tdy}), "
-                        f"{len(ref_pix)} comp stars"
-                    )
-
-        # Fallback B: sky coordinates (-wcs/-refwcs).
-        if lc_cmd is None:
-            self._log("WCS failed — using sky coordinates (-wcs)")
-            lc_cmd = (f"light_curve {registered} 0 "
-                      f"-wcs={star['ra']:.6f},{star['dec']:.6f}")
-            for cs in self.comp_stars:
-                lc_cmd += f" -refwcs={cs['ra']:.6f},{cs['dec']:.6f}"
-
-        # Strip BAYERPAT before light_curve to work around a Siril 1.4.3 bug:
-        # copyfits(CP_FORMAT) clears date_obs in the CFA copy used for PSF fitting,
-        # so seq->imgparam[i].date_obs is never populated → JD axis shows frame indices.
-        # Without BAYERPAT, Siril skips the CFA copy and reads date_obs correctly.
-        bayer_stripped: dict[Path, tuple[int, str]] = {}
-        for fit_path in sorted(proc.glob(f"{stem}_*.fit")):
-            result = _fits_strip_keyword(fit_path, "BAYERPAT")
-            if result:
-                bayer_stripped[fit_path] = result
-        if bayer_stripped:
-            self._log(f"BAYERPAT stripped from {len(bayer_stripped)} frames (date_obs fix)")
-
-        ok = self.runner.run_script(proc, [
-            f'cd "{proc}"',
-            f"setphot -aperture=10 -inner=20 -outer=30 -dyn_ratio=4.0 -gain={gain}",
-            lc_cmd,
-        ], "_s5_phot.ssf")
-
-        # Restore BAYERPAT regardless of outcome
-        for fit_path, (offset, val) in bayer_stripped.items():
-            _fits_restore_keyword(fit_path, "BAYERPAT", offset, val)
-        if bayer_stripped:
-            self._log("BAYERPAT restored")
-
-        if not ok:
-            self._done(False, "Step 5 failed (light_curve)"); return
-
-        # ── Collect results ──
-        lc_dat = proc / "light_curve.dat"
-        results_dir = session / "results"
-        results_dir.mkdir(exist_ok=True)
-        safe = star["name"].replace(" ", "_").replace("/", "-")
-        out_dat = results_dir / f"{safe}_light_curve.dat"
-        out_csv = results_dir / f"{safe}_aavso.csv"
-
-        if lc_dat.exists():
-            # Normalize .dat to absolute JD (handles all Siril output formats)
-            try:
-                first_fit = next(iter(sorted(proc.glob(f"{stem}_*.fit"))))
-                exptime_s = float(read_fits_header(first_fit).get("EXPTIME", 20.0))
-            except StopIteration:
-                exptime_s = 20.0
-            if inject_jd_into_dat(lc_dat, seq_file, stem, seq_fixlen, proc, exptime_s):
-                self._log("JD normalized to absolute JD ✓")
-            shutil.copy2(lc_dat, out_dat)
-
-            # Copy Siril's PNG (now has correct JD axis thanks to BAYERPAT fix)
-            out_png = results_dir / f"{safe}_light_curve.png"
-            png = proc / "light_curve.png"
-            if png.exists():
-                shutil.copy2(png, out_png)
-
-            rows = self._export_aavso(out_dat, out_csv, star["name"])
-            n_valid = len(rows)
-            n_total = sum(1 for l in out_dat.read_text().splitlines()
-                          if l and not l.startswith("#"))
-            self._log(f"AAVSO CSV: {n_valid}/{n_total} pts exported "
-                      f"(NaN and MERR>0.5 excluded)")
-            self._done(True, str(out_dat))
-        else:
-            self._done(False,
-                       "light_curve.dat not found.\n"
-                       "The target may be outside the field, or too faint.")
-
-    def _export_aavso(self, dat: Path, out: Path, name: str,
-                      merr_max: float = 0.5) -> list:
-        """Export light curve to AAVSO Extended format.
-        Filters NaN magnitudes and measurements with MERR > merr_max.
-        Returns the list of valid (jd, mag, err) rows written.
-        """
-        rows = []
-        with open(dat) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                try:
-                    jd_i = next(i for i, p in enumerate(parts) if float(p) > 2_400_000)
-                    jd   = float(parts[jd_i])
-                    mag  = float(parts[jd_i + 1])
-                    err  = float(parts[jd_i + 2]) if len(parts) > jd_i + 2 else 0.0
-                    if math.isnan(mag) or math.isnan(err):
-                        continue
-                    if err > merr_max:
-                        continue
-                    rows.append((jd, mag, err))
-                except (ValueError, StopIteration, IndexError):
-                    continue
-        if not rows:
-            return []
-        filt_key  = self.obs_filter_var.get()
+        filt_key = self.obs_filter_var.get()
         filt_code, filt_note = FILTER_OPTIONS.get(filt_key, ("CV", ""))
-        notes = f"seestar_s30pro|{filt_note}" if filt_note else "seestar_s30pro"
-
-        with open(out, "w", newline="") as f:
-            # Write header lines directly — csv.writer would quote "#DELIM=," (contains comma)
-            for line in ["#TYPE=EXTENDED", "#OBSCODE=XXXX",
-                         "#SOFTWARE=Siril+seestar_varstar_siril.py",
-                         f"#FILTER={filt_code}",
-                         "#DELIM=,", "#DATE=JD", "#OBSTYPE=CCD"]:
-                f.write(line + "\n")
-            w = csv.writer(f)
-            w.writerow(["NAME","DATE","MAG","MERR","FILT","TRANS","MTYPE",
-                        "CNAME","CMAG","KNAME","KMAG","AMASS","GROUP","CHART","NOTES"])
-            for jd, mag, err in rows:
-                w.writerow([name, f"{jd:.6f}", f"{mag:.4f}", f"{err:.4f}",
-                            filt_code, "NO", "DIFF",
-                            "ENSEMBLE", "na", "na", "na", "na", "1", "na",
-                            notes])
-        return rows
+        config = {
+            "session":    self.session_dir,
+            "star":       self.selected_star,
+            "comp_stars": list(self.comp_stars),
+            "nstars":     self.nstars_var.get(),
+            "start_step": self._get_start_step(),
+            "dark_dir":   Path(self.dark_var.get()) if self.dark_var.get().strip() else None,
+            "flat_dir":   Path(self.flat_var.get()) if self.flat_var.get().strip() else None,
+            "bias_dir":   Path(self.bias_var.get()) if self.bias_var.get().strip() else None,
+            "filt_code":  filt_code,
+            "filt_note":  filt_note,
+            "runner":     self.runner,
+        }
+        run_pipeline(config, self._log, self._prog, self._done)
 
     # ── Thread-safe helpers ───────────────────────────────────────────────────
 
