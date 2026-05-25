@@ -613,12 +613,16 @@ class App(tk.Tk):
                  + (s["dec"] - self.field_dec) ** 2) ** 0.5, 3
             )
 
-        # Keep only stars that project inside the actual image frame
+        # Keep only stars that project well inside the actual image frame.
+        # margin=200 gives ~200 px safety buffer on each side so that typical
+        # pointing drift over a session (50–150 px) doesn't cause the target
+        # to fall outside the registered-frame bounding box in many images.
         if self.field_wcs_hdr and self.field_naxis1 and self.field_naxis2:
             filtered = stars_in_frame(stars, self.field_wcs_hdr,
-                                      self.field_naxis1, self.field_naxis2)
+                                      self.field_naxis1, self.field_naxis2,
+                                      margin=200)
             self._log(f"VSX: {len(stars)} in search area → "
-                      f"{len(filtered)} within image frame")
+                      f"{len(filtered)} safely within image frame (margin 200 px)")
             stars = filtered
         else:
             self._log(f"VSX: {len(stars)} found (no WCS yet — plate-solve for exact filtering)")

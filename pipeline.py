@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 # ── optional runtime deps ────────────────────────────────────────────────────
 
@@ -844,22 +844,24 @@ def run_pipeline(config: dict,
         return round(fx - 0.5), round(naxis2 - fy + 0.5)
 
     # ── Early frame check (before any findcompstars / APASS query) ────────────
-    # VSX search radius may include stars just outside the actual image boundary.
-    # Catching this early avoids a wasted findcompstars call (10–30 s).
+    # margin=200 px: typical session drift (50-150 px) means edge stars miss
+    # many registered frames. 200 px ensures coverage in virtually all frames.
     tdx: Optional[int] = None
     tdy: Optional[int] = None
+    FRAME_MARGIN = 200   # safety buffer for target; comp stars use phot_margin=35
     if naxis1 and naxis2:
         tx, ty = sky_to_pixel(star["ra"], star["dec"], ref_hdr)
         if tx is not None:
             tdx, tdy = _to_disp(tx, ty)
-            margin = 35
-            if not (margin < tdx < naxis1 - margin and
-                    margin < tdy < naxis2 - margin):
+            if not (FRAME_MARGIN < tdx < naxis1 - FRAME_MARGIN and
+                    FRAME_MARGIN < tdy < naxis2 - FRAME_MARGIN):
                 on_done(False,
-                        f"'{star['name']}' is outside the image frame "
-                        f"(pixel {tdx},{tdy}, frame {naxis1}×{naxis2}).\n"
-                        "Re-run the VSX query to refresh the filtered list, "
-                        "then choose a star closer to the field centre.")
+                        f"'{star['name']}' is too close to the frame edge "
+                        f"(pixel {tdx},{tdy}, frame {naxis1}×{naxis2}, "
+                        f"safe zone {FRAME_MARGIN}px margin).\n"
+                        "Registration drift means this star is missing from "
+                        "many frames. Re-run the VSX query and choose a star "
+                        "closer to the field centre.")
                 return
             on_log(f"Target at display pixel ({tdx}, {tdy}) — in frame ✓")
         else:
