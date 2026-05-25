@@ -14,6 +14,7 @@ Troubleshoot:  Script > Run Script > test_connections.py
 from __future__ import annotations
 
 import csv
+import datetime
 import math
 import os
 import shutil
@@ -319,6 +320,81 @@ def truncate_comp_csv(csv_path: Path, n: int) -> int:
         return 0
 
 
+def dateobs_to_jd(date_str: str) -> Optional[float]:
+    """Convert a FITS DATE-OBS string (ISO 8601) to Julian Date (mid-exposure not applied)."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            dt = datetime.datetime.strptime(date_str.strip(), fmt)
+            delta = dt - datetime.datetime(2000, 1, 1, 12, 0, 0)
+            return 2451545.0 + delta.total_seconds() / 86400.0
+        except ValueError:
+            continue
+    return None
+
+
+def inject_jd_into_dat(dat_path: Path, seq_path: Path,
+                       stem: str, fixlen: int, proc: Path,
+                       exptime_s: float = 20.0) -> bool:
+    """Replace frame-index JD column in light_curve.dat with real Julian Dates.
+
+    Reads DATE-OBS from each r_light_XXXXX.fit file (selected frames in seq order).
+    Adds half the exposure time for mid-exposure JD.
+    Returns True if at least one JD was injected.
+    """
+    # Build ordered list of img_numbers for selected frames
+    selected_imgs: list[int] = []
+    try:
+        with open(seq_path) as fh:
+            for line in fh:
+                if line.startswith("I "):
+                    parts = line.split()
+                    img_num, flag = int(parts[1]), int(parts[2])
+                    if flag == 1:
+                        selected_imgs.append(img_num)
+    except Exception:
+        return False
+
+    # Map 1-based frame index → JD
+    jd_map: dict[int, float] = {}
+    half_exp = exptime_s / 86400.0 / 2.0
+    for idx, img_num in enumerate(selected_imgs, start=1):
+        fit_path = proc / f"{stem}_{img_num:0{fixlen}d}.fit"
+        hdr = read_fits_header(fit_path)
+        date_str = str(hdr.get("DATE-OBS", ""))
+        if date_str:
+            jd = dateobs_to_jd(date_str)
+            if jd is not None:
+                jd_map[idx] = jd + half_exp  # mid-exposure
+
+    if not jd_map:
+        return False
+
+    # Rewrite dat file: replace integer frame index with real JD
+    try:
+        lines = dat_path.read_text(encoding="utf-8").splitlines()
+        out: list[str] = []
+        for line in lines:
+            if "#JD_UT (+ 0)" in line:
+                out.append("#JD_UT")
+                continue
+            if line.startswith("#"):
+                out.append(line)
+                continue
+            parts = line.split()
+            if parts:
+                try:
+                    idx = round(float(parts[0]))
+                    if idx in jd_map:
+                        parts[0] = f"{jd_map[idx]:.6f}"
+                except (ValueError, KeyError):
+                    pass
+            out.append(" ".join(parts))
+        dat_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
 def get_gain_eadu(lights_dir: Path) -> float:
     """Read real gain in e-/ADU from the first FITS file in lights/.
     GAIN=200 on a Seestar is ISO-equivalent, not e-/ADU.
@@ -576,13 +652,13 @@ class App(tk.Tk):
         tk.Label(nstars_row, text="Comp stars:", bg=BG, fg=FG2,
                  font=("Helvetica", 11), width=9, anchor="w").pack(side="left")
         self.nstars_var = tk.IntVar(value=10)
-        tk.Spinbox(nstars_row, from_=3, to=50, textvariable=self.nstars_var,
+        tk.Spinbox(nstars_row, from_=3, to=19, textvariable=self.nstars_var,
                    width=5, bg=BG2, fg=FG, insertbackground=FG,
                    buttonbackground=SURFACE, font=("Helvetica", 11),
                    relief="flat", highlightthickness=1,
                    highlightbackground=BORDER,
                    highlightcolor=BLUE).pack(side="left", padx=(0, 8))
-        tk.Label(nstars_row, text="(3–50, used by findcompstars)", bg=BG, fg=FG2,
+        tk.Label(nstars_row, text="(3–19, Siril max=19)", bg=BG, fg=FG2,
                  font=("Helvetica", 10)).pack(side="left")
 
         # ── Calibration frames ────────────────────────────────────────────────
@@ -1169,7 +1245,7 @@ class App(tk.Tk):
             self.runner.run_script(proc, [
                 f'cd "{proc}"',
                 f"load {ref_fits_name}",
-                f'findcompstars "{star_arg}" -dvmag=3 -emag=0.05 -catalog=apass -out=comp_stars.csv',
+                f'findcompstars "{star_arg}" -narrow -dvmag=3 -emag=0.05 -catalog=apass -out=comp_stars.csv',
             ], "_s5a_findcomp.ssf")
             if comp_csv.exists() and comp_csv.stat().st_size > 50:
                 n = max(3, min(50, self.nstars_var.get()))
@@ -1216,7 +1292,7 @@ class App(tk.Tk):
 
         ok = self.runner.run_script(proc, [
             f'cd "{proc}"',
-            f"setphot -aperture=8 -inner=14 -outer=21 -gain={gain}",
+            f"setphot -aperture=8 -inner=14 -outer=21 -dyn_ratio=4.0 -gain={gain}",
             lc_cmd,
         ], "_s5_phot.ssf")
         if not ok:
@@ -1231,6 +1307,11 @@ class App(tk.Tk):
         out_csv = results_dir / f"{safe}_aavso.csv"
 
         if lc_dat.exists():
+            # Inject real Julian Dates from DATE-OBS headers before copying
+            if inject_jd_into_dat(lc_dat, seq_file, stem, seq_fixlen, proc):
+                self._log("JD timestamps injected from DATE-OBS headers ✓")
+            else:
+                self._log("WARNING: DATE-OBS not found — JD axis shows frame indices")
             shutil.copy2(lc_dat, out_dat)
             png = proc / "light_curve.png"
             if png.exists():
