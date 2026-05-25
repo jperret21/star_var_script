@@ -634,13 +634,13 @@ class App(tk.Tk):
                                  s.get("mag", 99), s.get("var_type", "?"),
                                  s.get("period", "—")])
 
-        # Update Siril annotation catalogue and trigger overlay
+        # Write in-frame stars to Siril's user DSO catalogue (for manual Annotate in GUI)
         cat_path = find_siril_user_catalogue()
         if cat_path and stars:
             n_new = update_siril_catalogue(stars, cat_path)
             if n_new:
-                self._log(f"Siril catalogue: {n_new} new star(s) added → {cat_path.name}")
-            self._show_field_annotated()
+                self._log(f"Siril catalogue: {n_new} new star(s) added to {cat_path.name}")
+                self._log("  → in Siril: Outils > Astrométrie > Annoter to see them")
 
         self.all_stars = sorted(stars, key=lambda s: s["dist"])
         self.after(0, lambda: (
@@ -648,57 +648,6 @@ class App(tk.Tk):
             self._log(f"VSX: {len(stars)} variable stars in field"),
             self._btn_state(True),
         ))
-
-    def _show_field_annotated(self):
-        """Load a plate-solved image in Siril's GUI and trigger the annotation overlay.
-
-        Prefer a registered plate-solved frame (has WCS from step 4) so that annotate
-        can position the circles immediately.  Fall back to the stack + platesolve when
-        no registered frames exist yet.
-        """
-        if not self.session_dir or not self.runner:
-            return
-        proc = self.session_dir / "process"
-
-        # Registered plate-solved frames (step 4) already have WCS — use the middle one
-        # so we pick a well-exposed frame near the reference rather than frame #1.
-        target: Optional[Path] = None
-        need_platesolve = False
-        for seq in ("r_light_", "r_pp_light_"):
-            frames = sorted(proc.glob(f"{seq.rstrip('_')}*.fit"))
-            if frames:
-                target = frames[len(frames) // 2]
-                break
-
-        # Fall back to the stack; we'll plate-solve it on the fly.
-        if target is None:
-            for cand in ["process/lights.fit", "process/result.fit"]:
-                p = self.session_dir / cand
-                if p.exists():
-                    target, need_platesolve = p, True
-                    break
-        if target is None:
-            for p in self.session_dir.glob("*_og.fit"):
-                target, need_platesolve = p, True
-                break
-        if target is None:
-            return
-
-        iface = getattr(self.runner, "_iface", None)
-        if not iface:
-            self._log("Tip: in Siril open the stack and use "
-                      "Outils > Astrométrie > Annoter to see the stars")
-            return
-
-        try:
-            iface.cmd("load", str(target))
-            if need_platesolve:
-                self._log("Siril: plate-solving stack for annotation…")
-                iface.cmd("platesolve", "-focal=160", "-pixelsize=2.9", "-radius=2.5")
-            iface.cmd("annotate")
-            self._log("Siril: variable stars annotated in main window")
-        except Exception as e:
-            self._log(f"Siril annotate: {e}")
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
 

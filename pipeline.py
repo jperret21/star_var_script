@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 # ── optional runtime deps ────────────────────────────────────────────────────
 
@@ -829,9 +829,44 @@ def run_pipeline(config: dict,
     comp_csv = proc / "comp_stars.csv"
     lc_cmd   = None
 
+    # ── Resolve ref frame WCS once (reused by frame check + FALLBACK A) ──────
+    ref_hdr: dict = {}
+    naxis1 = naxis2 = 0
+    if ref_img_num is not None:
+        _rf = proc / f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
+        if _rf.exists():
+            ref_hdr = read_fits_header(_rf)
+            naxis1  = int(ref_hdr.get("NAXIS1", 0))
+            naxis2  = int(ref_hdr.get("NAXIS2", 0))
+
+    def _to_disp(fx: float, fy: float) -> tuple[int, int]:
+        """WCS pixel (1-indexed, y-up FITS) → Siril display pixel (0-indexed, y-down)."""
+        return round(fx - 0.5), round(naxis2 - fy + 0.5)
+
+    # ── Early frame check (before any findcompstars / APASS query) ────────────
+    # VSX search radius may include stars just outside the actual image boundary.
+    # Catching this early avoids a wasted findcompstars call (10–30 s).
+    tdx: Optional[int] = None
+    tdy: Optional[int] = None
+    if naxis1 and naxis2:
+        tx, ty = sky_to_pixel(star["ra"], star["dec"], ref_hdr)
+        if tx is not None:
+            tdx, tdy = _to_disp(tx, ty)
+            margin = 35
+            if not (margin < tdx < naxis1 - margin and
+                    margin < tdy < naxis2 - margin):
+                on_done(False,
+                        f"'{star['name']}' is outside the image frame "
+                        f"(pixel {tdx},{tdy}, frame {naxis1}×{naxis2}).\n"
+                        "Re-run the VSX query to refresh the filtered list, "
+                        "then choose a star closer to the field centre.")
+                return
+            on_log(f"Target at display pixel ({tdx}, {tdy}) — in frame ✓")
+        else:
+            on_log("Frame WCS not available — skipping bounds check")
+
     # ── PRIMARY: findcompstars → -ninastars ───────────────────────────────────
-    # Requires a plate-solved ref frame loaded into gfit (has_wcs check in Siril).
-    # VSX names sometimes have a "V* " prefix that GCVS doesn't use — strip it.
+    # VSX names sometimes have a "V* " prefix that GCVS/SIMBAD doesn't use.
     ref_fits_name = (
         f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
         if ref_img_num is not None else None
@@ -839,7 +874,6 @@ def run_pipeline(config: dict,
     if ref_fits_name and (proc / ref_fits_name).exists():
         if comp_csv.exists():
             comp_csv.unlink()
-        # Normalize name: strip "V* " prefix that VSX adds but GCVS/Siril doesn't use
         star_arg = star["name"].removeprefix("V* ").replace('"', '\\"')
         on_log(f"[PRIMARY] findcompstars '{star_arg}' (APASS, dvmag=3, emag=0.05)")
         runner.run_script(proc, [
@@ -852,12 +886,10 @@ def run_pipeline(config: dict,
             lc_cmd = f"light_curve {registered} 0 -ninastars=comp_stars.csv"
             on_log(f"[PRIMARY] OK — {kept} comp stars via findcompstars")
         else:
-            on_log(f"[PRIMARY] FAILED — '{star_arg}' not found in Siril catalog "
-                   f"(GCVS/SIMBAD name mismatch?) → trying fallback A")
+            on_log(f"[PRIMARY] FAILED — '{star_arg}' not in Siril catalog → trying fallback A")
 
-    # ── FALLBACK A: APASS via VizieR + pixel coords from WCS ─────────────────
-    # Uses dvmag=3.5 because VSX reports max brightness, not mean — the star may
-    # be 1-2 mag fainter than listed when observed near minimum.
+    # ── FALLBACK A: APASS via VizieR + pixel coords ───────────────────────────
+    # dvmag=3.5: VSX reports max brightness, star may be 1-2 mag fainter at minimum.
     if lc_cmd is None and ref_img_num is not None:
         if not comp_stars:
             on_log(f"[FALLBACK A] querying APASS (radius=1.5°, dvmag=3.5) …")
@@ -866,55 +898,28 @@ def run_pipeline(config: dict,
             if comp_stars:
                 on_log(f"[FALLBACK A] {len(comp_stars)} APASS comp stars found")
             else:
-                on_log(f"[FALLBACK A] no APASS stars found "
-                       f"(target mag={star['mag']:.1f}, radius=1.5°) → trying fallback B")
+                on_log(f"[FALLBACK A] no APASS stars (target mag={star['mag']:.1f}) → trying fallback B")
 
-    if lc_cmd is None and ref_img_num is not None and comp_stars:
-        ref_fits = proc / f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
-        ref_hdr  = read_fits_header(ref_fits)
-        naxis1   = int(ref_hdr.get("NAXIS1", 0))
-        naxis2   = int(ref_hdr.get("NAXIS2", 0))
-        tx, ty   = sky_to_pixel(star["ra"], star["dec"], ref_hdr)
-
-        if tx is None or naxis1 == 0 or naxis2 == 0:
-            on_log("[FALLBACK A] WCS not available on ref frame → trying fallback B")
+    if lc_cmd is None and comp_stars and tdx is not None and naxis1:
+        margin = 35
+        ref_pix = []
+        for cs in comp_stars:
+            rx, ry = sky_to_pixel(cs["ra"], cs["dec"], ref_hdr)
+            if rx is not None:
+                rdx, rdy = _to_disp(rx, ry)
+                if (margin < rdx < naxis1 - margin and
+                        margin < rdy < naxis2 - margin):
+                    ref_pix.append((rdx, rdy))
+        if ref_pix:
+            lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
+            for rdx, rdy in ref_pix:
+                lc_cmd += f" -refat={rdx},{rdy}"
+            on_log(f"[FALLBACK A] OK — target ({tdx},{tdy}), "
+                   f"{len(ref_pix)}/{len(comp_stars)} comp stars in frame")
         else:
-            def _to_disp(fx, fy, n2=naxis2):
-                return round(fx - 0.5), round(n2 - fy + 0.5)
-
-            tdx, tdy = _to_disp(tx, ty)
-
-            # Margin = outer ring + small buffer so PSF fit doesn't touch the edge
-            margin = 35
-            if not (margin < tdx < naxis1 - margin and
-                    margin < tdy < naxis2 - margin):
-                on_done(False,
-                        f"'{star['name']}' is outside the image frame "
-                        f"(display pos: {tdx},{tdy}; image: {naxis1}×{naxis2}).\n"
-                        "Select a star closer to the center of the field.")
-                return
-
-            ref_pix = []
-            for cs in comp_stars:
-                rx, ry = sky_to_pixel(cs["ra"], cs["dec"], ref_hdr)
-                if rx is not None:
-                    rdx, rdy = _to_disp(rx, ry)
-                    if (margin < rdx < naxis1 - margin and
-                            margin < rdy < naxis2 - margin):
-                        ref_pix.append((rdx, rdy))
-
-            if ref_pix:
-                lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
-                for rdx, rdy in ref_pix:
-                    lc_cmd += f" -refat={rdx},{rdy}"
-                on_log(f"[FALLBACK A] OK — target ({tdx},{tdy}), "
-                       f"{len(ref_pix)}/{len(comp_stars)} comp stars in frame")
-            else:
-                on_log("[FALLBACK A] no comp stars project inside frame "
-                       "→ trying fallback B")
+            on_log("[FALLBACK A] no comp stars project inside frame → trying fallback B")
 
     # ── FALLBACK B: sky coordinates (-wcs/-refwcs) ────────────────────────────
-    # Last resort — less reliable, but avoids a silent failure.
     if lc_cmd is None:
         if not comp_stars:
             on_done(False,
