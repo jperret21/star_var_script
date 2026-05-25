@@ -302,6 +302,23 @@ class SirilRunner:
         return Path(os.getcwd())
 
 
+def truncate_comp_csv(csv_path: Path, n: int) -> int:
+    """Keep only the first n Comp1 entries in a findcompstars CSV. Returns kept count."""
+    try:
+        lines = csv_path.read_text(encoding="utf-8").splitlines()
+        out, comp_kept = [], 0
+        for line in lines:
+            if line.startswith("Comp1,") and comp_kept >= n:
+                continue
+            if line.startswith("Comp1,"):
+                comp_kept += 1
+            out.append(line)
+        csv_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        return comp_kept
+    except Exception:
+        return 0
+
+
 def get_gain_eadu(lights_dir: Path) -> float:
     """Read real gain in e-/ADU from the first FITS file in lights/.
     GAIN=200 on a Seestar is ISO-equivalent, not e-/ADU.
@@ -553,6 +570,20 @@ class App(tk.Tk):
                              "Photometry only (step 5)"],
                      state="readonly", width=34,
                      style="Dark.TCombobox").pack(side="left", padx=(0, 4))
+
+        nstars_row = self._row(obs_card)
+        nstars_row.pack(fill="x", pady=(4, 0))
+        tk.Label(nstars_row, text="Comp stars:", bg=BG, fg=FG2,
+                 font=("Helvetica", 11), width=9, anchor="w").pack(side="left")
+        self.nstars_var = tk.IntVar(value=10)
+        tk.Spinbox(nstars_row, from_=3, to=50, textvariable=self.nstars_var,
+                   width=5, bg=BG2, fg=FG, insertbackground=FG,
+                   buttonbackground=SURFACE, font=("Helvetica", 11),
+                   relief="flat", highlightthickness=1,
+                   highlightbackground=BORDER,
+                   highlightcolor=BLUE).pack(side="left", padx=(0, 8))
+        tk.Label(nstars_row, text="(3–50, used by findcompstars)", bg=BG, fg=FG2,
+                 font=("Helvetica", 10)).pack(side="left")
 
         # ── Calibration frames ────────────────────────────────────────────────
         cal_card = tk.LabelFrame(right, text=" Calibration frames  (optional) ",
@@ -1141,8 +1172,10 @@ class App(tk.Tk):
                 f'findcompstars "{star_arg}" -dvmag=3 -emag=0.05 -catalog=apass -out=comp_stars.csv',
             ], "_s5a_findcomp.ssf")
             if comp_csv.exists() and comp_csv.stat().st_size > 50:
+                n = max(3, min(50, self.nstars_var.get()))
+                kept = truncate_comp_csv(comp_csv, n)
                 lc_cmd = f"light_curve {registered} 0 -ninastars=comp_stars.csv"
-                self._log("Siril comparison stars ready (findcompstars)")
+                self._log(f"Siril comparison stars ready: {kept} stars (findcompstars)")
             else:
                 self._log("findcompstars produced no output — falling back to manual comp stars")
 
