@@ -426,17 +426,17 @@ def get_gain_eadu(lights_dir: Path) -> float:
 # Theme
 # ─────────────────────────────────────────────────────────────────────────────
 
-BG      = "#16162a"   # main background
-BG2     = "#1e1e35"   # widget background
-SURFACE = "#2a2a45"   # raised surface
-BORDER  = "#3a3a5c"   # borders
-FG      = "#e8e8f0"   # primary text  (high contrast on BG)
-FG2     = "#b0b0c8"   # secondary text
-BLUE    = "#7aa2f7"   # accent / headings
-CYAN    = "#7dcfff"   # info values
-GREEN   = "#9ece6a"   # success
-RED     = "#f7768e"   # error / target star
-YELLOW  = "#e0af68"   # warnings / field info
+BG      = "#2d2d2d"   # equilux bg_color (Siril dark theme)
+BG2     = "#1f1f1f"   # equilux dark_bg_color
+SURFACE = "#3c3c3c"   # equilux base_color (buttons, raised areas)
+BORDER  = "#484848"   # borders / dividers
+FG      = "#dedede"   # equilux fg_color
+FG2     = "#9a9a9a"   # secondary / dimmed text
+BLUE    = "#5294e2"   # equilux selected_bg_color (accent)
+CYAN    = "#4eb3c9"   # info / coordinate values
+GREEN   = "#7ab648"   # success
+RED     = "#d45c6e"   # error / target star
+YELLOW  = "#c89030"   # warnings / field info
 MONO    = ("Menlo", "Courier New", "monospace")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -611,12 +611,6 @@ class App(tk.Tk):
         self.lbl_coord = tk.Label(card, text="", bg=BG, fg=FG2,
                                   font=("Helvetica", 10), anchor="w")
         self.lbl_coord.pack(fill="x")
-        tk.Frame(card, bg=BORDER, height=1).pack(fill="x", pady=4)
-        self.lbl_comp = tk.Label(card, text="Comparison stars: 0",
-                                 bg=BG, fg=FG2, font=("Helvetica", 11), anchor="w")
-        self.lbl_comp.pack(fill="x")
-        self._button(card, "Fetch comparison stars (APASS)",
-                     self._fetch_comp).pack(anchor="w", pady=(4, 0))
 
         # ── Observation settings ──────────────────────────────────────────────
         obs_card = tk.LabelFrame(right, text=" Observation settings ",
@@ -693,7 +687,7 @@ class App(tk.Tk):
             state="disabled",
             bg=SURFACE,
             fg=FG2,
-            hover_bg="#16a34a",
+            hover_bg="#3a7bd5",
             font=("Helvetica", 13, "bold"),
             pady=10,
         )
@@ -740,8 +734,8 @@ class App(tk.Tk):
               background=[("selected", SURFACE)],
               foreground=[("selected", BLUE)])
         s.configure("Green.Horizontal.TProgressbar",
-                    troughcolor=BG2, background="#22c55e",
-                    lightcolor="#16a34a", darkcolor="#15803d")
+                    troughcolor=BG2, background=BLUE,
+                    lightcolor="#3a7bd5", darkcolor="#2060c0")
         s.configure("TScrollbar",
                     background=SURFACE, troughcolor=BG2,
                     arrowcolor=FG2, bordercolor=BORDER)
@@ -967,8 +961,7 @@ class App(tk.Tk):
         self.lbl_coord.configure(
             text=f"RA {star['ra']:.5f}°  /  Dec {star['dec']:+.5f}°  ·  mag {star['mag']:.2f}"
         )
-        self.lbl_comp.configure(text="Comparison stars: 0")
-        self.run_btn.configure(state="normal", bg="#22c55e", fg="#0a2a0a")
+        self.run_btn.configure(state="normal", bg="#3a7bd5", fg=FG)
 
     # ── VSX catalog ───────────────────────────────────────────────────────────
 
@@ -1004,25 +997,6 @@ class App(tk.Tk):
             self._refresh_table(),
             self._log(f"VSX: {len(stars)} variable stars found in field"),
             self._btn_state(True),
-        ))
-
-    # ── Comparison stars ──────────────────────────────────────────────────────
-
-    def _fetch_comp(self):
-        if not self.selected_star:
-            messagebox.showinfo("Info", "Select a target star first.")
-            return
-        self._log(f"Fetching comparison stars for {self.selected_star['name']} (APASS)…")
-        threading.Thread(target=self._fetch_comp_bg, daemon=True).start()
-
-    def _fetch_comp_bg(self):
-        s = self.selected_star
-        comps = query_apass(s["ra"], s["dec"], s["mag"])
-        self.comp_stars = comps
-        msg = f"{len(comps)} comparison stars from APASS"
-        self.after(0, lambda: (
-            self.lbl_comp.configure(text=msg),
-            self._log(msg),
         ))
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
@@ -1255,10 +1229,14 @@ class App(tk.Tk):
             else:
                 self._log("findcompstars produced no output — falling back to manual comp stars")
 
-        # Fallback A: manual display-space pixel coords computed from our VizieR APASS query.
+        # Fallback A: manual display-space pixel coords.
         # -at/-refat expect Siril display coords: display_x = fits_x - 0.5,
         # display_y = NAXIS2 - fits_y + 0.5  (Y-flip + 0.5 offset, integer-rounded).
         # -autoring is incompatible with -at mode in Siril 1.4.3.
+        if lc_cmd is None and ref_img_num is not None:
+            if not self.comp_stars:
+                self._log("findcompstars failed — auto-fetching APASS comparison stars…")
+                self.comp_stars = query_apass(star["ra"], star["dec"], star["mag"])
         if lc_cmd is None and ref_img_num is not None and self.comp_stars:
             ref_fits = proc / f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
             ref_hdr  = read_fits_header(ref_fits)
@@ -1378,15 +1356,15 @@ class App(tk.Tk):
         if self.selected_star:
             self.after(0, lambda: self.run_btn.configure(
                 state="normal" if enabled else "disabled",
-                bg="#22c55e" if enabled else SURFACE,
-                fg="#0a2a0a" if enabled else FG2,
+                bg=BLUE if enabled else SURFACE,
+                fg=FG if enabled else FG2,
             ))
 
     def _done(self, success: bool, msg: str):
         self.after(0, lambda: self._done_ui(success, msg))
 
     def _done_ui(self, ok: bool, msg: str):
-        self.run_btn.configure(state="normal", bg="#22c55e", fg="#0a2a0a")
+        self.run_btn.configure(state="normal", bg=BLUE, fg=FG)
         self.prog_var.set(100 if ok else 0)
         if ok:
             self.lbl_prog.configure(text="Done!", fg=GREEN)
