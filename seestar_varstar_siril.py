@@ -1138,10 +1138,10 @@ class App(tk.Tk):
             self.runner.run_script(proc, [
                 f'cd "{proc}"',
                 f"load {ref_fits_name}",
-                f'findcompstars "{star_arg}" -dvmag=2 -emag=0.03 -catalog=apass -out=comp_stars.csv',
+                f'findcompstars "{star_arg}" -dvmag=3 -emag=0.05 -catalog=apass -out=comp_stars.csv',
             ], "_s5a_findcomp.ssf")
             if comp_csv.exists() and comp_csv.stat().st_size > 50:
-                lc_cmd = f"light_curve {registered} 0 -autoring -ninastars=comp_stars.csv"
+                lc_cmd = f"light_curve {registered} 0 -ninastars=comp_stars.csv"
                 self._log("Siril comparison stars ready (findcompstars)")
             else:
                 self._log("findcompstars produced no output — falling back to manual comp stars")
