@@ -157,5 +157,66 @@ class TestStarsInFrame(unittest.TestCase):
         self.assertEqual(result[0]["name"], "center")
 
 
+class TestSkyToPixelRotated(unittest.TestCase):
+    """sky_to_pixel with a real rotated WCS (PC matrix ≠ identity).
+
+    Values taken from an actual Seestar plate-solved r_light frame (~42° rotation).
+    This exercises the rotated-field code path where CDELT × PC matrix ≠ simple
+    diagonal CD matrix.
+    """
+
+    HDR = {
+        "NAXIS1": 2160.0, "NAXIS2": 3840.0,
+        "CRVAL1": 149.246533, "CRVAL2": 69.072210,
+        "CRPIX1": 1080.5,    "CRPIX2": 1920.5,
+        "CDELT1": -0.00102032, "CDELT2": 0.00102019,
+        "PC1_1": -0.736069,  "PC1_2":  0.676906,
+        "PC2_1":  0.676688,  "PC2_2":  0.736270,
+    }
+
+    def _in_frame(self, ra, dec, margin=35):
+        naxis1 = int(self.HDR["NAXIS1"]); naxis2 = int(self.HDR["NAXIS2"])
+        px, py = sky_to_pixel(ra, dec, self.HDR)
+        if px is None:
+            return False
+        tdx = round(px - 0.5)
+        tdy = round(naxis2 - py + 0.5)
+        return (margin < tdx < naxis1 - margin and
+                margin < tdy < naxis2 - margin)
+
+    def test_crval_maps_to_crpix(self):
+        px, py = sky_to_pixel(self.HDR["CRVAL1"], self.HDR["CRVAL2"], self.HDR)
+        self.assertAlmostEqual(px, self.HDR["CRPIX1"], places=3)
+        self.assertAlmostEqual(py, self.HDR["CRPIX2"], places=3)
+
+    def test_edge_star_in_frame(self):
+        # NSVS J0941171+685517: 3.9° from field centre in RA but still within
+        # the rotated frame due to the ~42° position angle.
+        self.assertTrue(self._in_frame(145.3213, 68.9214))
+
+    def test_apass_comps_near_edge_star_excluded(self):
+        # APASS stars found within 1.5° of the edge star project BELOW the frame
+        # (disp-y > NAXIS2) because the field rotation sends them out of bounds.
+        out_of_frame_samples = [
+            (143.7988, 67.6621),
+            (143.0804, 68.0335),
+            (143.1283, 67.7389),
+        ]
+        for ra, dec in out_of_frame_samples:
+            self.assertFalse(self._in_frame(ra, dec),
+                             msg=f"Expected ({ra},{dec}) to be outside frame")
+
+    def test_field_centre_comps_in_frame(self):
+        # APASS stars around CRVAL are guaranteed to be in frame.
+        centre_samples = [
+            (149.7710, 68.7973),
+            (148.9206, 69.0633),
+            (149.2537, 68.9019),
+        ]
+        for ra, dec in centre_samples:
+            self.assertTrue(self._in_frame(ra, dec),
+                            msg=f"Expected ({ra},{dec}) to be inside frame")
+
+
 if __name__ == "__main__":
     unittest.main()

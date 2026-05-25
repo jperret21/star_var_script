@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 # ── optional runtime deps ────────────────────────────────────────────────────
 
@@ -910,16 +910,38 @@ def run_pipeline(config: dict,
                 if (margin < rdx < naxis1 - margin and
                         margin < rdy < naxis2 - margin):
                     ref_pix.append((rdx, rdy))
+        if not ref_pix and ref_hdr.get("CRVAL1"):
+            # Target near the field edge — retry APASS around the frame centre so
+            # at least some reference stars land inside the image.
+            on_log("[FALLBACK A] no in-frame comp stars near target "
+                   "— retrying APASS around field centre (radius=0.5°) …")
+            centre_comps = query_apass(
+                float(ref_hdr["CRVAL1"]), float(ref_hdr["CRVAL2"]),
+                star["mag"], radius_deg=0.5, n=nstars, dvmag=3.5)
+            for cs in centre_comps:
+                rx, ry = sky_to_pixel(cs["ra"], cs["dec"], ref_hdr)
+                if rx is not None:
+                    rdx, rdy = _to_disp(rx, ry)
+                    if (margin < rdx < naxis1 - margin and
+                            margin < rdy < naxis2 - margin):
+                        ref_pix.append((rdx, rdy))
+            if ref_pix:
+                on_log(f"[FALLBACK A] {len(ref_pix)} comp stars from field centre")
+            else:
+                on_log("[FALLBACK A] no comp stars in frame (tried target + field centre)")
         if ref_pix:
             lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
             for rdx, rdy in ref_pix:
                 lc_cmd += f" -refat={rdx},{rdy}"
             on_log(f"[FALLBACK A] OK — target ({tdx},{tdy}), "
-                   f"{len(ref_pix)}/{len(comp_stars)} comp stars in frame")
+                   f"{len(ref_pix)} comp stars in frame")
         else:
-            on_log("[FALLBACK A] no comp stars project inside frame → trying fallback B")
+            on_log("[FALLBACK A] no comp stars in frame → trying fallback B")
 
     # ── FALLBACK B: sky coordinates (-wcs/-refwcs) ────────────────────────────
+    # Only used when we have no pixel coords (no WCS on ref frame).
+    # Always filter comp stars to in-frame only — Siril aborts on the first
+    # -refwcs coordinate that falls outside the image.
     if lc_cmd is None:
         if not comp_stars:
             on_done(False,
@@ -927,10 +949,28 @@ def run_pipeline(config: dict,
                     "Check: internet connection for APASS query, target magnitude "
                     "filter, or select a different star.")
             return
+        inframe_comps: list[dict] = []
+        if tdx is not None and naxis1:
+            margin = 35
+            for cs in comp_stars:
+                rx, ry = sky_to_pixel(cs["ra"], cs["dec"], ref_hdr)
+                if rx is not None:
+                    rdx, rdy = _to_disp(rx, ry)
+                    if (margin < rdx < naxis1 - margin and
+                            margin < rdy < naxis2 - margin):
+                        inframe_comps.append(cs)
+        else:
+            inframe_comps = comp_stars  # no WCS — pass all and let Siril decide
+        if not inframe_comps:
+            on_done(False,
+                    f"No in-frame comparison stars found for '{star['name']}'.\n"
+                    "The target may be at the edge of the field with no suitable "
+                    "APASS reference stars in the image. Try a different star.")
+            return
         on_log("[FALLBACK B] using sky coordinates (-wcs/-refwcs)")
         lc_cmd = (f"light_curve {registered} 0 "
                   f"-wcs={star['ra']:.6f},{star['dec']:.6f}")
-        for cs in comp_stars:
+        for cs in inframe_comps:
             lc_cmd += f" -refwcs={cs['ra']:.6f},{cs['dec']:.6f}"
 
     # Strip BAYERPAT before light_curve to work around a Siril 1.4.3 bug:
