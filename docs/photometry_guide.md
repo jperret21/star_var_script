@@ -1,85 +1,85 @@
-# Notes techniques — pipeline photométrie
+# Pipeline — Technical Notes
 
 ---
 
-## Versions
+## Version history
 
-| Version | Changements |
-|---------|-------------|
-| v0.1.5 | chemin PRIMARY via `findcompstars` + `-ninastars` ; V_app ensembliste ; FWHM depuis `.seq` |
-| v0.1.4 | marge de sécurité bord de champ portée à 200 px |
-| v0.1.3 | filtrage in-frame des étoiles de comparaison FALLBACK A/B |
-| v0.1.2 | vérification précoce des frames à l'étape 5 ; suppression de `annotate` Siril |
-| v0.1.1 | filtrage des frames par WCS |
-| v0.1.0 | première version |
+| Version | Changes |
+|---------|---------|
+| v0.1.5 | PRIMARY path via `findcompstars` + `-ninastars`; ensemble V_app; FWHM from `.seq` |
+| v0.1.4 | Frame border safety margin raised to 200 px |
+| v0.1.3 | In-frame filtering of comp stars for FALLBACK A/B |
+| v0.1.2 | Early frame check at step 5; removed broken Siril annotate |
+| v0.1.1 | WCS-based frame filtering |
+| v0.1.0 | Initial release |
 
 ---
 
-## v0.1.5 — Comment ça marche
+## v0.1.5 — How it works
 
-### 1. Chemin de session
+### 1. Session path
 
-L'utilisateur donne le chemin du dossier de session, qui doit contenir un sous-dossier `lights/` avec les frames FITS du Seestar. Au chargement, le script lit les headers FITS du premier fichier pour récupérer :
+The user provides the session folder path, which must contain a `lights/` subfolder with Seestar FITS frames. On load, the script reads the FITS headers of the first file to get:
 
-- `OBJCTRA` / `OBJCTDEC` ou `RA` / `DEC` → centre du champ (coordonnées équatoriales)
-- `NAXIS1` / `NAXIS2` + échelle de plaque → taille du champ en degrés
-- Nombre de fichiers `.fit` dans `lights/`
+- `OBJCTRA` / `OBJCTDEC` or `RA` / `DEC` → field center (equatorial coordinates)
+- `NAXIS1` / `NAXIS2` + plate scale → field size in degrees
+- Count of `.fit` files in `lights/`
 
-### 2. Requête du catalogue VSX
+### 2. VSX catalog query
 
-Une recherche en cône est envoyée à **VizieR** (`B/vsx/vsx`) autour du centre du champ. Le rayon de recherche est la moitié de la diagonale du champ de vue, arrondie à 0.1° supérieur — assez large pour inclure les étoiles proches du bord.
+A cone search is sent to **VizieR** (`B/vsx/vsx`) around the field center. Search radius is half the field diagonal, rounded up to the nearest 0.1° — wide enough to catch stars near the edges.
 
-Filtre par défaut : magnitude maximale **14**. Toutes les étoiles variables VSX dans ce rayon et sous ce seuil sont retournées et affichées dans le tableau. L'utilisateur peut filtrer par nom ou type dans l'interface, et ajuster la magnitude max.
+Default magnitude limit: **14**. All VSX variable stars within the cone and below this threshold are returned and displayed in the table. The user can filter by name or type in the UI and adjust the magnitude limit.
 
-### 3. Sélection de la cible et des étoiles de comparaison
+### 3. Target and comparison star selection
 
-Après sélection d'une cible dans le tableau, le script appelle `findcompstars` (Siril) ou VizieR APASS DR9 selon la disponibilité. Voir la section [sélection du chemin photométrique](#sélection-du-chemin-photométrique) pour le détail.
+After selecting a target from the table, the script calls `findcompstars` (Siril) or queries VizieR APASS DR9 depending on availability. See [photometry path selection](#photometry-path-selection) for details.
 
-### 4. Filtre et frames de calibration
+### 4. Filter and calibration frames
 
-**Filtre :** choix entre LP (défaut Seestar) ou sans filtre. Affecte uniquement le champ `FILT` dans l'export AAVSO (`CV` dans les deux cas — pas de bande photométrique standard).
+**Filter:** choice between LP (Seestar default) or no filter. Only affects the `FILT` field in the AAVSO export (`CV` in both cases — neither matches a standard photometric band).
 
-**Calibration :** l'utilisateur peut fournir des dossiers de darks, flats et/ou bias. Si au moins un type est fourni, le pipeline crée les masters automatiquement à l'étape 0 :
+**Calibration:** the user can provide folders of darks, flats, and/or bias frames. If at least one type is given, the pipeline creates masters automatically at step 0:
 
 ```
-link dark_ → stack dark_ rej 3 3 -nonorm → master_dark.fit
+link dark_ → stack dark_ rej 3 3 -nonorm  → master_dark.fit
 link flat_  → stack flat_  rej 3 3 -norm=mul → master_flat.fit
-link bias_  → stack bias_  rej 3 3 -nonorm → master_bias.fit
+link bias_  → stack bias_  rej 3 3 -nonorm  → master_bias.fit
 calibrate light_ -dark=... -flat=... -bias=...  → pp_light_*.fit
 ```
 
-Le stacking utilise le rejet sigma Winsorized 3σ, robuste aux cosmiques et trainées satellite. Sans calibration, la séquence active reste `light_`.
+Stacking uses Winsorized sigma clipping 3σ, robust against cosmic rays and satellite trails. Without calibration, the active sequence stays `light_`.
 
-### 5. Exécution — étapes et algorithmes
+### 5. Run — steps and algorithms
 
-**Étape 1+2 — Registration**
+**Steps 1+2 — Registration**
 
 ```
 link light -out=process/
 register light_ -2pass
 ```
 
-`register -2pass` fait du pattern matching d'étoiles, entièrement offline. La transformation calculée par frame est une similarité : translation + rotation + scale uniforme, pas de correction de distorsion. Les résultats (matrices de transformation) sont écrits dans `light_.seq`.
+`register -2pass` does offline star-pattern matching. The transform computed per frame is a similarity: translation + rotation + uniform scale — no distortion correction. Results (transform matrices) are written to `light_.seq`.
 
-**Étape 3 — Application des transformations**
+**Step 3 — Apply transforms**
 
 ```
 seqapplyreg light_ -framing=max -filter-round=2.5k  →  r_light_*.fit
 ```
 
-`-framing=max` : les frames de sortie utilisent l'union de tous les champs, donc sont plus grandes que l'entrée. Les étoiles proches du bord apparaissent dans moins de frames — d'où la marge d'exclusion de 200 px pour les étoiles de comp (v0.1.4).
+`-framing=max`: output frames use the union of all fields of view, so they are larger than the input. Stars near the edges appear in fewer frames — hence the 200 px border exclusion for comp star selection (v0.1.4).
 
-`-filter-round=2.5k` : garde les 2500 meilleures frames par élongation stellaire. Sur une session Seestar de 200–500 frames ça ne rejette généralement rien, mais élimine les frames avec vibration ou trainée.
+`-filter-round=2.5k`: keeps the 2500 best frames by star elongation. On a typical Seestar session of 200–500 frames this usually rejects nothing, but guards against wind-shake or satellite trail frames.
 
-**Étape 4 — Plate solve par frame**
+**Step 4 — Per-frame plate solve**
 
 ```
 seqplatesolve r_light_ -nocache -force -focal=160 -pixelsize=2.9 -radius=2.5
 ```
 
-Chaque frame reçoit sa propre solution astrométrique contre le catalogue Gaia DR3 (en ligne). Les headers WCS (`CRVAL`, `CRPIX`, matrice `CD`) sont écrits dans chaque `r_light_*.fit`. Nécessaire parce qu'après `-framing=max`, le WCS de la frame de référence n'est pas valide pour les autres.
+Each frame gets its own astrometric solution against the Gaia DR3 catalog (online). WCS headers (`CRVAL`, `CRPIX`, `CD` matrix) are written into every `r_light_*.fit`. Required because after `-framing=max`, the reference frame WCS does not apply to the others.
 
-**Étape 5 — Photométrie**
+**Step 5 — Photometry**
 
 ```
 findcompstars <target> -catalog=APASS -narrowband=0 -max_stars=N  →  comp_stars.csv
@@ -87,17 +87,17 @@ setphot -aperture=10 -inner=20 -outer=30 -gain=1.0
 light_curve r_light_ 0 -ninastars=comp_stars.csv
 ```
 
-`light_curve` fait de la photométrie d'ouverture sur chaque frame. Le canal `0` correspond à la seule couche des frames mono issues de la registration CFA. La sortie brute est `light_curve.dat` (JD, V-C, erreur).
+`light_curve` runs aperture photometry on every frame. Channel `0` is the only layer in the mono frames produced by CFA registration. Raw output is `light_curve.dat` (JD, V-C, error).
 
-**Post-traitement Python**
+**Python post-processing**
 
-Après la sortie de Siril, le pipeline Python :
-1. Lit `light_curve.dat`
-2. Calcule `V_app = V_C + median(V_catalog_comp)` depuis `comp_stars.csv`
-3. Extrait le FWHM par frame depuis `r_light_.seq` (lignes `R0`), aligne avec `DATE-OBS` des FITS, convertit en arcsec
-4. Écrit les fichiers de résultats
+After Siril exits, the Python pipeline:
+1. Reads `light_curve.dat`
+2. Computes `V_app = V_C + median(V_catalog_comp)` from `comp_stars.csv`
+3. Extracts per-frame FWHM from `r_light_.seq` (R0 lines), aligns with `DATE-OBS` from FITS headers, converts to arcsec
+4. Writes result files
 
-### 6. Sorties
+### 6. Output
 
 ```
 results/StarName/
@@ -106,7 +106,7 @@ results/StarName/
 └── StarName_aavso.csv   AAVSO Extended Format
 ```
 
-`photometry.csv` :
+`photometry.csv`:
 ```
 # Ensemble V (APASS comp stars median): 12.284
 # V_app = V_C + ensemble_V
@@ -114,7 +114,7 @@ JD,V_C,V_app,err
 2461161.334643,1.2421,13.5261,0.0868
 ```
 
-`fwhm.csv` :
+`fwhm.csv`:
 ```
 # Plate scale: 1.0350 arcsec/px
 JD,FWHM_x_arcsec,FWHM_y_arcsec
@@ -123,59 +123,59 @@ JD,FWHM_x_arcsec,FWHM_y_arcsec
 
 ---
 
-## Sélection du chemin photométrique
+## Photometry path selection
 
 **PRIMARY** — `findcompstars` + `-ninastars`
 
-Siril gère lui-même la conversion coordonnées célestes → pixels via les WCS. Nécessite WCS valide sur toutes les frames et au moins 3 comp stars dans le champ.
+Siril handles the sky-to-pixel coordinate conversion internally via the WCS headers. Requires valid WCS on all frames and at least 3 comp stars in the field.
 
-**FALLBACK A** — coordonnées pixel depuis VizieR
+**FALLBACK A** — pixel coordinates from VizieR
 
-Comp stars récupérées sur VizieR APASS DR9 (`e_Vmag < 0.05`, `|delta_V| < 2.0`), converties en pixel par projection TAN depuis le WCS de la frame de référence. Coordonnées arrondies à l'entier (Siril 1.4.x refuse les décimales).
+Comp stars queried from VizieR APASS DR9 (`e_Vmag < 0.05`, `|delta_V| < 2.0`), converted to pixels via TAN projection from the reference frame WCS. Coordinates rounded to integers — Siril 1.4.x rejects decimals.
 
-**FALLBACK B** — une seule étoile proche
+**FALLBACK B** — single nearest bright star
 
-Dernier recours. Magnitude différentielle plus bruitée, variabilité intrinsèque de la comp star non détectable.
+Last resort. Differential magnitude is noisier, and any intrinsic variability of the comp star goes undetected.
 
 ---
 
-## V_app : biais filtre LP
+## V_app and the LP filter bias
 
 `V_app = V_C + median(V_catalog)`
 
-V_C n'est pas affecté par le filtre LP (cible et comp passent par le même filtre). Le biais entre en jeu via `median(V_catalog)` qui est en V standard APASS. Pour une nova naine (continuum bleu + compagnon rouge) vs des comp G/K, attendre ±0.2–0.5 mag en absolu. Les variations relatives dans une session sont fiables.
+V_C is unaffected by the LP filter (target and comp stars go through the same filter). The bias enters via `median(V_catalog)`, which is in standard APASS V while the observation is in LP. For a cataclysmic variable (blue + red) vs. G/K comp stars, expect ±0.2–0.5 mag absolute offset. Relative variations within a session are reliable.
 
-`seqsetmag` (calibration magnitude dans Siril) n'est pas scriptable en headless — V_app est donc calculé externement.
-
----
-
-## Bugs Siril 1.4.x contournés
-
-| Bug / limite | Contournement |
-|-------------|---------------|
-| Coords pixel en `-at` doivent être des entiers | `round()` avant de construire la commande |
-| `-autoring` incompatible avec `-at` | `setphot` avec valeurs fixes |
-| `seqsetmag` non scriptable en headless | V_app calculé depuis `comp_stars.csv` |
-| Parser `.ssf` inclut les guillemets dans le path | Toujours `-out=path` sans guillemets |
-| `seqpsf` headless : sortie console uniquement | Non utilisé ; FWHM lu depuis `.seq` |
-| `light_curve -wcs` peut échouer sur frames sans WCS | PRIMARY utilise `-ninastars` ; FALLBACK A utilise `-at` |
+`seqsetmag` (Siril's magnitude calibration) is not scriptable in headless mode — V_app is therefore computed externally.
 
 ---
 
-## Échelle de plaque
+## Siril 1.4.x bugs worked around
+
+| Bug / limitation | Workaround |
+|-----------------|------------|
+| `-at` pixel coords must be integers | `round()` before building the command |
+| `-autoring` incompatible with `-at` | Fixed `setphot` values instead |
+| `seqsetmag` not scriptable in headless | V_app computed from `comp_stars.csv` |
+| `.ssf` parser includes quotes in path | Always use `-out=path` unquoted |
+| `seqpsf` headless: console output only, no file | Not used; FWHM read from `.seq` instead |
+| `light_curve -wcs` can fail on frames with missing WCS | PRIMARY uses `-ninastars`; FALLBACK A uses `-at` |
+
+---
+
+## Plate scale
 
 ```
-206.265 * 2.9 µm / 160 mm = 3.74 arcsec/px   (pixel Bayer brut)
+206.265 * 2.9 µm / 160 mm = 3.74 arcsec/px   (raw Bayer pixel)
 ```
 
-La valeur utilisée pour FWHM `.seq` → arcsec est **1.035 arcsec/px** — le Seestar empile en interne des sub-expositions de 10s avec un léger drizzle, ce qui modifie légèrement l'échelle effective.
+The value used for FWHM `.seq` → arcsec conversion is **1.035 arcsec/px** — the Seestar internally stacks 10s sub-exposures with slight drizzle, which shifts the effective pixel scale.
 
-> TODO : vérifier 1.035 empiriquement depuis la matrice CD d'une frame plate-solvée.
+> TODO: verify 1.035 empirically from the CD matrix of a plate-solved frame.
 
 ---
 
 ## Gain e⁻/ADU
 
-`get_gain_eadu()` cherche dans l'ordre : `EGAIN`, `EPERDN`, `GAIN_E`, `CCDGAIN`, puis `GAIN`. Valeur acceptée seulement si `0.05 < g < 30`. Le Seestar écrit `GAIN=200` (réglage caméra, pas e⁻/ADU) — rejeté par cette plage, retombe sur **1.0 e⁻/ADU**.
+`get_gain_eadu()` tries headers in order: `EGAIN`, `EPERDN`, `GAIN_E`, `CCDGAIN`, then `GAIN`. Value accepted only if `0.05 < g < 30`. The Seestar writes `GAIN=200` (camera setting, not e⁻/ADU) — rejected by this range, falls back to **1.0 e⁻/ADU**.
 
-Valeur physique IMX585 au gain 200 : ~0.5–0.7 e⁻/ADU. Les barres d'erreur sont donc ~20–40% trop larges — sans impact sur la photométrie différentielle. L'app de pilotage Seestar devra écrire `EGAIN` dans les headers pour corriger ça.
+Physical IMX585 value at gain 200: ~0.5–0.7 e⁻/ADU. Error bars are therefore ~20–40% too wide — conservative and harmless for differential photometry. The Seestar control app should write `EGAIN` into FITS headers; `get_gain_eadu()` will pick it up automatically.
