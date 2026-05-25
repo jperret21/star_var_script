@@ -422,6 +422,94 @@ def get_gain_eadu(lights_dir: Path) -> float:
                 pass
     return 1.0
 
+
+def generate_light_curve_plot(dat_path: Path, out_path: Path,
+                               star_name: str, merr_max: float = 0.5) -> bool:
+    """Generate a publication-quality light curve PNG from a Siril .dat file.
+
+    Reads JD, V-C magnitude and uncertainty. Filters NaN and MERR > merr_max.
+    X-axis: UT time (hours). Y-axis: V-C differential mag (inverted, brighter up).
+    Returns True on success.
+    """
+    try:
+        import matplotlib
+    except ImportError:
+        # Siril's embedded Python may lack matplotlib — add common install paths
+        import sys as _sys
+        for _sp in [
+            "/opt/homebrew/lib/python3.11/site-packages",
+            "/opt/homebrew/lib/python3.12/site-packages",
+            "/opt/homebrew/lib/python3.13/site-packages",
+            "/usr/local/lib/python3.11/site-packages",
+            "/usr/local/lib/python3.12/site-packages",
+        ]:
+            if _sp not in _sys.path:
+                _sys.path.insert(0, _sp)
+        try:
+            import matplotlib
+        except ImportError:
+            return False
+    try:
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as ticker
+    except Exception:
+        return False
+
+    jds, mags, errs = [], [], []
+    with open(dat_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            try:
+                jd  = float(parts[0])
+                mag = float(parts[1])
+                err = float(parts[2]) if len(parts) > 2 else 0.0
+                if math.isnan(mag) or math.isnan(err) or err > merr_max:
+                    continue
+                if jd < 2_400_000:   # still frame indices — skip
+                    continue
+                jds.append(jd); mags.append(mag); errs.append(err)
+            except (ValueError, IndexError):
+                continue
+
+    if len(jds) < 3:
+        return False
+
+    # Convert JD to UT hours: (JD − 0.5) mod 1 × 24
+    ut = [((j - 0.5) % 1) * 24 for j in jds]
+
+    # Derive observation date from first JD
+    epoch = datetime.datetime(2000, 1, 1, 12, 0, 0)
+    obs_dt = epoch + datetime.timedelta(days=jds[0] - 2451545.0)
+    date_str = obs_dt.strftime("%Y-%m-%d")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.errorbar(ut, mags, yerr=errs, fmt="o", ms=3.5,
+                color="#5294e2", ecolor="#aaaaaa",
+                capsize=2, linewidth=0.7, label="V−C")
+    ax.invert_yaxis()   # photometric convention: brighter at top
+    ax.set_xlabel(f"UT {date_str} (hours)", fontsize=12)
+    ax.set_ylabel("V−C  (instrumental diff. mag)", fontsize=12)
+    ax.set_title(f"Light curve — {star_name}", fontsize=13)
+    ax.xaxis.set_minor_locator(ticker.AutoMinorLocator(4))
+    ax.yaxis.set_minor_locator(ticker.AutoMinorLocator(4))
+    ax.grid(True, which="major", alpha=0.3, linestyle="--")
+    ax.grid(True, which="minor", alpha=0.1, linestyle=":")
+    n_pts = len(jds)
+    span_min = (max(jds) - min(jds)) * 24 * 60
+    ax.text(0.98, 0.02,
+            f"{n_pts} pts · {span_min:.0f} min · MERR < {merr_max} mag",
+            transform=ax.transAxes, ha="right", va="bottom",
+            fontsize=8, color="gray")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close()
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Theme
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1270,7 +1358,7 @@ class App(tk.Tk):
 
         ok = self.runner.run_script(proc, [
             f'cd "{proc}"',
-            f"setphot -aperture=8 -inner=14 -outer=21 -dyn_ratio=4.0 -gain={gain}",
+            f"setphot -aperture=10 -inner=20 -outer=30 -dyn_ratio=4.0 -gain={gain}",
             lc_cmd,
         ], "_s5_phot.ssf")
         if not ok:
@@ -1286,22 +1374,46 @@ class App(tk.Tk):
 
         if lc_dat.exists():
             # Inject real Julian Dates from DATE-OBS headers before copying
-            if inject_jd_into_dat(lc_dat, seq_file, stem, seq_fixlen, proc):
+            exptime = get_gain_eadu  # reuse first-FITS scan; read EXPTIME separately
+            try:
+                first_fit = next(iter(sorted(proc.glob(f"{stem}_*.fit"))))
+                exptime_s = float(read_fits_header(first_fit).get("EXPTIME", 20.0))
+            except StopIteration:
+                exptime_s = 20.0
+            if inject_jd_into_dat(lc_dat, seq_file, stem, seq_fixlen, proc, exptime_s):
                 self._log("JD timestamps injected from DATE-OBS headers ✓")
             else:
                 self._log("WARNING: DATE-OBS not found — JD axis shows frame indices")
             shutil.copy2(lc_dat, out_dat)
-            png = proc / "light_curve.png"
-            if png.exists():
-                shutil.copy2(png, results_dir / f"{safe}_light_curve.png")
-            self._export_aavso(out_dat, out_csv, star["name"])
+
+            # Generate our own plot with correct JD, units and filtering
+            out_png = results_dir / f"{safe}_light_curve.png"
+            if generate_light_curve_plot(out_dat, out_png, star["name"]):
+                self._log("Light curve plot generated ✓")
+            else:
+                # Fallback: copy Siril's raw PNG (frame-index x-axis)
+                png = proc / "light_curve.png"
+                if png.exists():
+                    shutil.copy2(png, out_png)
+
+            rows = self._export_aavso(out_dat, out_csv, star["name"])
+            n_valid = len(rows)
+            n_total = sum(1 for l in out_dat.read_text().splitlines()
+                          if l and not l.startswith("#"))
+            self._log(f"AAVSO CSV: {n_valid}/{n_total} pts exported "
+                      f"(NaN and MERR>0.5 excluded)")
             self._done(True, str(out_dat))
         else:
             self._done(False,
                        "light_curve.dat not found.\n"
                        "The target may be outside the field, or too faint.")
 
-    def _export_aavso(self, dat: Path, out: Path, name: str):
+    def _export_aavso(self, dat: Path, out: Path, name: str,
+                      merr_max: float = 0.5) -> list:
+        """Export light curve to AAVSO Extended format.
+        Filters NaN magnitudes and measurements with MERR > merr_max.
+        Returns the list of valid (jd, mag, err) rows written.
+        """
         rows = []
         with open(dat) as f:
             for line in f:
@@ -1310,33 +1422,39 @@ class App(tk.Tk):
                     continue
                 parts = line.split()
                 try:
-                    vals = [float(p) for p in parts]
-                    jd_i = next(i for i, v in enumerate(vals) if v > 2_400_000)
-                    rows.append((vals[jd_i], vals[jd_i+1],
-                                 vals[jd_i+2] if len(vals) > jd_i+2 else 0.0))
-                except (ValueError, StopIteration):
+                    jd_i = next(i for i, p in enumerate(parts) if float(p) > 2_400_000)
+                    jd   = float(parts[jd_i])
+                    mag  = float(parts[jd_i + 1])
+                    err  = float(parts[jd_i + 2]) if len(parts) > jd_i + 2 else 0.0
+                    if math.isnan(mag) or math.isnan(err):
+                        continue
+                    if err > merr_max:
+                        continue
+                    rows.append((jd, mag, err))
+                except (ValueError, StopIteration, IndexError):
                     continue
         if not rows:
-            return
+            return []
         filt_key  = self.obs_filter_var.get()
         filt_code, filt_note = FILTER_OPTIONS.get(filt_key, ("CV", ""))
         notes = f"seestar_s30pro|{filt_note}" if filt_note else "seestar_s30pro"
 
         with open(out, "w", newline="") as f:
+            # Write header lines directly — csv.writer would quote "#DELIM=," (contains comma)
+            for line in ["#TYPE=EXTENDED", "#OBSCODE=XXXX",
+                         "#SOFTWARE=Siril+seestar_varstar_siril.py",
+                         f"#FILTER={filt_code}",
+                         "#DELIM=,", "#DATE=JD", "#OBSTYPE=CCD"]:
+                f.write(line + "\n")
             w = csv.writer(f)
-            for d in ["#TYPE=EXTENDED", "#OBSCODE=XXXX",
-                      "#SOFTWARE=Siril+seestar_varstar_siril.py",
-                      f"#FILTER={filt_code}",
-                      "#DELIM=,", "#DATE=JD", "#OBSTYPE=CCD"]:
-                w.writerow([d])
             w.writerow(["NAME","DATE","MAG","MERR","FILT","TRANS","MTYPE",
                         "CNAME","CMAG","KNAME","KMAG","AMASS","GROUP","CHART","NOTES"])
             for jd, mag, err in rows:
-                # MTYPE=DIFF: differential photometry — no instrumental→standard transform
                 w.writerow([name, f"{jd:.6f}", f"{mag:.4f}", f"{err:.4f}",
                             filt_code, "NO", "DIFF",
                             "ENSEMBLE", "na", "na", "na", "na", "1", "na",
                             notes])
+        return rows
 
     # ── Thread-safe helpers ───────────────────────────────────────────────────
 
