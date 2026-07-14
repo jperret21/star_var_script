@@ -272,8 +272,11 @@ def _stats_box(ax: plt.Axes, jd: np.ndarray, mag: np.ndarray, err: np.ndarray,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def plot_light_curve(data: dict, bin_min: float = 5.0,
-                     sigma: float = 3.0) -> plt.Figure:
-    """Main light curve: apparent V (top) + differential V-C (bottom) + optional FWHM."""
+                     sigma: float = 3.0, show_bins: bool = True) -> plt.Figure:
+    """Main light curve: apparent V (top) + differential V-C (bottom) + optional FWHM.
+
+    show_bins : overlay the weighted (bin_min)-minute bins if True.
+    """
     with plt.rc_context(RCPARAMS):
         jd       = data["jd"]
         err      = data["err"]
@@ -328,11 +331,12 @@ def plot_light_curve(data: dict, bin_min: float = 5.0,
                         label=f"Individual ({mask.sum()} pts)")
 
             # Weighted bins
-            t_b, v_b, e_b = weighted_bin(t[mask], vapp[mask], err[mask], bin_min)
-            ax.errorbar(t_b, v_b, yerr=e_b,
-                        fmt="s", color=C_BIN_V, markersize=6,
-                        elinewidth=1.2, ecolor=C_BIN_V, linewidth=0,
-                        zorder=5, label=f"{bin_min:.0f}-min bins")
+            if show_bins:
+                t_b, v_b, e_b = weighted_bin(t[mask], vapp[mask], err[mask], bin_min)
+                ax.errorbar(t_b, v_b, yerr=e_b,
+                            fmt="s", color=C_BIN_V, markersize=6,
+                            elinewidth=1.2, ecolor=C_BIN_V, linewidth=0,
+                            zorder=5, label=f"{bin_min:.0f}-min bins")
 
             _mag_axis(ax, vapp[mask])
             ax.set_ylabel(r"$V$  [mag]", labelpad=4)
@@ -365,10 +369,11 @@ def plot_light_curve(data: dict, bin_min: float = 5.0,
                        elinewidth=0.6, ecolor=C_ERR, alpha=0.55,
                        linewidth=0, zorder=3)
 
-        t_b, v_b, e_b = weighted_bin(t[mask], vc[mask], err[mask], bin_min)
-        ax_vc.errorbar(t_b, v_b, yerr=e_b,
-                       fmt="s", color=C_BIN_VC, markersize=6,
-                       elinewidth=1.2, ecolor=C_BIN_VC, linewidth=0, zorder=5)
+        if show_bins:
+            t_b, v_b, e_b = weighted_bin(t[mask], vc[mask], err[mask], bin_min)
+            ax_vc.errorbar(t_b, v_b, yerr=e_b,
+                           fmt="s", color=C_BIN_VC, markersize=6,
+                           elinewidth=1.2, ecolor=C_BIN_VC, linewidth=0, zorder=5)
 
         _mag_axis(ax_vc, vc[mask])
         ax_vc.set_ylabel(r"$V - C$  [mag]", labelpad=4)
@@ -407,6 +412,80 @@ def plot_light_curve(data: dict, bin_min: float = 5.0,
         else:
             _jd_axis(ax_vc, jd, label_bottom=True)
 
+        fig.align_ylabels()
+        return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Figure 1b — single-panel light curve (choose V or V-C)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_single(data: dict, quantity: str = "V", bin_min: float = 5.0,
+                sigma: float = 3.0, show_bins: bool = True) -> plt.Figure:
+    """Single-panel light curve of one quantity.
+
+    quantity  : "V" for apparent magnitude (needs V_app column) or "V-C" for
+                differential magnitude.
+    show_bins : overlay the weighted (bin_min)-minute bins if True.
+    """
+    with plt.rc_context(RCPARAMS):
+        jd   = data["jd"]
+        err  = data["err"]
+        star = data["star_name"]
+
+        q = quantity.upper().replace(" ", "").replace("–", "-")
+        if q in ("V", "VAPP", "V_APP"):
+            if not data["has_vapp"]:
+                raise ValueError(
+                    "No apparent V (V_app) column in this dataset — "
+                    "use quantity='V-C'.")
+            mag    = data["vapp"]
+            ylabel = r"$V$  [mag]"
+            c_bin  = C_BIN_V
+        elif q in ("V-C", "VC"):
+            mag    = data["vc"]
+            ylabel = r"$V - C$  [mag]"
+            c_bin  = C_BIN_VC
+        else:
+            raise ValueError(f"quantity must be 'V' or 'V-C', got {quantity!r}")
+
+        mask = sigma_clip(mag, err, sigma)
+        n_cl = int((~mask).sum())
+
+        fig, ax = plt.subplots(figsize=(7.2, 4.5))
+
+        off = int(jd.min())
+        t   = jd - off
+
+        # Clipped outliers
+        if n_cl:
+            ax.errorbar(t[~mask], mag[~mask], yerr=err[~mask],
+                        fmt="x", color=C_CLIP, markersize=4,
+                        elinewidth=0.6, ecolor=C_CLIP, alpha=0.55,
+                        zorder=2, label=f"Rejected ({sigma}σ)")
+
+        # Individual points
+        ax.errorbar(t[mask], mag[mask], yerr=err[mask],
+                    fmt="o", color=C_PTS, markersize=2.5,
+                    elinewidth=0.6, ecolor=C_ERR, alpha=0.55,
+                    linewidth=0, zorder=3,
+                    label=f"Individual ({mask.sum()} pts)")
+
+        # Weighted bins
+        if show_bins:
+            t_b, v_b, e_b = weighted_bin(t[mask], mag[mask], err[mask], bin_min)
+            ax.errorbar(t_b, v_b, yerr=e_b,
+                        fmt="s", color=c_bin, markersize=6,
+                        elinewidth=1.2, ecolor=c_bin, linewidth=0,
+                        zorder=5, label=f"{bin_min:.0f}-min bins")
+
+        _mag_axis(ax, mag[mask])
+        ax.set_ylabel(ylabel, labelpad=4)
+        _stats_box(ax, t[mask], mag[mask], err[mask], n_cl, sigma,
+                   loc="lower left")
+        ax.legend(loc="upper right", markerscale=1.3)
+        ax.set_title(star, fontsize=14, fontweight="bold", pad=6)
+        _jd_axis(ax, jd, label_bottom=True)
         fig.align_ylabels()
         return fig
 
@@ -484,8 +563,12 @@ def plot_diagnostics(data: dict, sigma: float = 3.0) -> plt.Figure:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def plot_phase_folded(data: dict, period: float, t0: float | None = None,
-                      bin_min: float = 1.0, sigma: float = 3.0) -> plt.Figure:
-    """Phase-folded light curve. period in days."""
+                      bin_min: float = 1.0, sigma: float = 3.0,
+                      show_bins: bool = True) -> plt.Figure:
+    """Phase-folded light curve. period in days.
+
+    show_bins : overlay the weighted (bin_min)-minute bins if True.
+    """
     with plt.rc_context(RCPARAMS):
         jd       = data["jd"]
         err      = data["err"]
@@ -516,10 +599,11 @@ def plot_phase_folded(data: dict, period: float, t0: float | None = None,
                     fmt="o", color=C_PTS, markersize=2.5, linewidth=0,
                     elinewidth=0.6, ecolor=C_ERR, alpha=0.45,
                     zorder=3, label=f"Individual ({mask.sum()} pts)")
-        ax.errorbar(ph_b, m_b, yerr=e_b,
-                    fmt="s", color=C_PHASE, markersize=7,
-                    elinewidth=1.3, ecolor=C_PHASE, linewidth=0,
-                    zorder=5, label=f"{bin_min:.0f}-min bins")
+        if show_bins:
+            ax.errorbar(ph_b, m_b, yerr=e_b,
+                        fmt="s", color=C_PHASE, markersize=7,
+                        elinewidth=1.3, ecolor=C_PHASE, linewidth=0,
+                        zorder=5, label=f"{bin_min:.0f}-min bins")
 
         ax.invert_yaxis()
         ax.set_xlabel(f"Phase  (P = {period:.4f} d)", labelpad=4)

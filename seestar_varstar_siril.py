@@ -34,6 +34,7 @@ from pipeline import (  # noqa: E402
     SirilRunner,
     find_siril_cli,
     read_fits_header,
+    list_fits,
     stars_in_frame,
     stars_in_safe_circle,
     find_siril_user_catalogue,
@@ -41,6 +42,7 @@ from pipeline import (  # noqa: E402
     query_vsx,
     query_apass,
     run_pipeline,
+    resolve_frame_dir,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,6 +94,28 @@ class DarkButton(tk.Label):
         tk.Label.configure(self, **kw)
 
     config = configure
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HMS/DMS → decimal degree helpers  (used when reading FITS OBJCTRA/OBJCTDEC)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hms_to_deg(hms: str) -> float:
+    """Convert 'HH MM SS.ss' (sexagesimal RA) to decimal degrees."""
+    parts = hms.strip().split()
+    if len(parts) >= 3:
+        return (float(parts[0]) + float(parts[1]) / 60 + float(parts[2]) / 3600) * 15
+    return float(hms)  # already decimal
+
+
+def _dms_to_deg(dms: str) -> float:
+    """Convert '±DD MM SS.ss' (sexagesimal Dec) to decimal degrees."""
+    dms = dms.strip()
+    sign = -1 if dms.startswith('-') else 1
+    parts = dms.lstrip('+-').split()
+    if len(parts) >= 3:
+        return sign * (float(parts[0]) + float(parts[1]) / 60 + float(parts[2]) / 3600)
+    return float(dms)  # already decimal
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main window
@@ -273,6 +297,52 @@ class App(tk.Tk):
         tk.Label(nstars_row, text="(3–19, Siril max=19)", bg=BG, fg=FG2,
                  font=("Helvetica", 10)).pack(side="left")
 
+        phot_card = tk.LabelFrame(right, text=" Photometry (setphot) ",
+                                  bg=BG, fg=BLUE, font=("Helvetica", 11, "bold"),
+                                  relief="solid", bd=1, padx=8, pady=6)
+        phot_card.pack(fill="x", pady=(0, 6))
+
+        self.ap_var      = tk.DoubleVar(value=10.0)
+        self.inner_var   = tk.DoubleVar(value=20.0)
+        self.outer_var   = tk.DoubleVar(value=30.0)
+        self.dyn_var     = tk.DoubleVar(value=4.0)
+        self.maxval_var  = tk.DoubleVar(value=60000.0)
+
+        def _phot_spin(parent, var, frm, to, inc, width=7):
+            return tk.Spinbox(parent, from_=frm, to=to, increment=inc,
+                              textvariable=var, width=width, bg=BG2, fg=FG,
+                              insertbackground=FG, buttonbackground=SURFACE,
+                              font=("Helvetica", 11), relief="flat",
+                              highlightthickness=1, highlightbackground=BORDER,
+                              highlightcolor=BLUE)
+
+        pr1 = self._row(phot_card)
+        pr1.pack(fill="x", pady=(0, 4))
+        tk.Label(pr1, text="Inner:", bg=BG, fg=FG2, font=("Helvetica", 11),
+                 width=9, anchor="w").pack(side="left")
+        _phot_spin(pr1, self.inner_var, 3, 300, 5).pack(side="left", padx=(0, 8))
+        tk.Label(pr1, text="Outer:", bg=BG, fg=FG2, font=("Helvetica", 11),
+                 anchor="w").pack(side="left")
+        _phot_spin(pr1, self.outer_var, 5, 400, 5).pack(side="left", padx=(4, 0))
+
+        pr2 = self._row(phot_card)
+        pr2.pack(fill="x", pady=(0, 4))
+        tk.Label(pr2, text="Dyn ratio:", bg=BG, fg=FG2, font=("Helvetica", 11),
+                 width=9, anchor="w").pack(side="left")
+        _phot_spin(pr2, self.dyn_var, 1.0, 5.0, 0.5).pack(side="left", padx=(0, 8))
+        tk.Label(pr2, text="Aper:", bg=BG, fg=FG2, font=("Helvetica", 11),
+                 anchor="w").pack(side="left")
+        _phot_spin(pr2, self.ap_var, 2, 100, 1).pack(side="left", padx=(4, 0))
+
+        pr3 = self._row(phot_card)
+        pr3.pack(fill="x")
+        tk.Label(pr3, text="Max val:", bg=BG, fg=FG2, font=("Helvetica", 11),
+                 width=9, anchor="w").pack(side="left")
+        _phot_spin(pr3, self.maxval_var, 1000, 65535, 1000, width=9).pack(
+            side="left", padx=(0, 8))
+        tk.Label(pr3, text="(saturation cut for comp stars)", bg=BG, fg=FG2,
+                 font=("Helvetica", 10)).pack(side="left")
+
         cal_card = tk.LabelFrame(right, text=" Calibration frames  (optional) ",
                                  bg=BG, fg=BLUE, font=("Helvetica", 11, "bold"),
                                  relief="solid", bd=1, padx=8, pady=6)
@@ -390,17 +460,23 @@ class App(tk.Tk):
         self.after(0, lambda: self.lbl_siril.configure(text=status, fg=color))
 
         if self.session_dir is None:
+            # A session holds lights in either layout: lights/*.fits (legacy) or
+            # Lights/<filter>/*.fits (Argos).
+            def _is_session(d: Path) -> bool:
+                return d.is_dir() and resolve_frame_dir(d, ["lights", "light"]) is not None
+
             wd = self.runner.get_working_dir()
-            if wd and (wd / "lights").is_dir():
+            if wd and _is_session(wd):
                 self.session_dir = wd
             else:
                 for base in [Path("/Volumes/Seestar/MyWorks"),
+                             Path.home() / "Argos" / "sessions",
                              Path.home() / "Desktop",
                              Path.home() / "Documents"]:
                     if not base.exists():
                         continue
                     for child in sorted(base.iterdir(), reverse=True):
-                        if child.is_dir() and (child / "lights").is_dir():
+                        if _is_session(child):
                             self.session_dir = child
                             break
                     if self.session_dir:
@@ -431,6 +507,18 @@ class App(tk.Tk):
 
     def _load_session_bg(self):
         session = self.session_dir
+
+        # Auto-fill calibration fields from the session's own calib folders
+        # (Argos: Darks/<sub>/, Flats/<sub>/, Biases/<sub>/) unless already set.
+        for var, names in [(self.dark_var, ["darks", "dark"]),
+                           (self.flat_var, ["flats", "flat"]),
+                           (self.bias_var, ["biases", "bias"])]:
+            if not var.get().strip():
+                d = resolve_frame_dir(session, names)
+                if d:
+                    self.after(0, lambda v=var, p=d: v.set(str(p)))
+                    self._log(f"Calibration auto-detected: {d.name} → {d}")
+
         stack = None
         for cand in ["process/lights.fit", "process/result.fit"]:
             p = session / cand
@@ -452,6 +540,26 @@ class App(tk.Tk):
             dec      = float(h.get("DEC",      h.get("CRVAL2", 0)))
             obj      = str(h.get("OBJECT",     "?"))
             n_frames = int(float(h.get("STACKCNT", 0)))
+        else:
+            # No stack yet — read RA/Dec from the first light frame
+            lights = resolve_frame_dir(session, ["lights", "light"])
+            if lights:
+                first = next(iter(list_fits(lights)), None)
+                if first:
+                    h = read_fits_header(first)
+                    ra_raw = h.get("OBJCTRA") or h.get("RA") or h.get("CRVAL1", 0)
+                    dec_raw = h.get("OBJCTDEC") or h.get("DEC") or h.get("CRVAL2", 0)
+                    # Handle sexagesimal strings (e.g. "19 25 29.00") or numeric
+                    if isinstance(ra_raw, str) and (' ' in ra_raw or ':' in ra_raw):
+                        ra = _hms_to_deg(ra_raw)
+                    else:
+                        ra = float(ra_raw or 0)
+                    if isinstance(dec_raw, str) and (' ' in dec_raw or ':' in dec_raw):
+                        dec = _dms_to_deg(dec_raw)
+                    else:
+                        dec = float(dec_raw or 0)
+                    obj      = str(h.get("OBJECT", "?"))
+                    n_frames = len(list_fits(lights))
 
         self.field_ra, self.field_dec = ra, dec
         info = f"{obj}  ·  RA {ra:.4f}°  Dec {dec:+.4f}°  ·  {n_frames} stacked frames"
@@ -691,6 +799,11 @@ class App(tk.Tk):
             "filt_code":  filt_code,
             "filt_note":  filt_note,
             "runner":     self.runner,
+            "phot_aperture":  self.ap_var.get(),
+            "phot_inner":     self.inner_var.get(),
+            "phot_outer":     self.outer_var.get(),
+            "phot_dyn_ratio": self.dyn_var.get(),
+            "phot_max_val":   self.maxval_var.get(),
         }
         run_pipeline(config, self._log, self._prog, self._done)
 

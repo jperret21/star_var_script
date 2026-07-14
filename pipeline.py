@@ -163,7 +163,7 @@ def sky_to_pixel(ra: float, dec: float, hdr: dict):
                  math.cos(dec0) * math.cos(dec_r) * math.cos(dra))
         if abs(denom) < 1e-10:
             return None, None
-        x = math.degrees(-math.cos(dec_r) * math.sin(dra) / denom)
+        x = math.degrees(math.cos(dec_r) * math.sin(dra) / denom)
         y = math.degrees((math.cos(dec0) * math.sin(dec_r) -
                           math.sin(dec0) * math.cos(dec_r) * math.cos(dra)) / denom)
         det = cd11 * cd22 - cd12 * cd21
@@ -313,24 +313,27 @@ def _vizier_tsv(catalog: str, ra: float, dec: float,
         "-c.u": "arcmin",
         "-out": ",".join(columns),
         "-out.max": str(max_rows),
+        # Sort by distance from field centre: without this, VizieR returns rows
+        # in catalog order and -out.max can truncate away the central stars
+        # (e.g. RR Lyr lost among >500 KIC variables in the Kepler field).
+        "-sort": "_r",
     }
     if filters:
         params.update(filters)
     try:
         r = requests.get(VIZIER, params=params, timeout=20)
         r.raise_for_status()
+        # TSV layout: #comments, column names, units, dashed separator, data.
         rows = []
-        header_skipped = 0
+        in_data = False
         for line in r.text.splitlines():
             if line.startswith("#") or not line.strip():
                 continue
             if line.startswith("-"):
-                header_skipped = 0
+                in_data = True
                 continue
-            header_skipped += 1
-            if header_skipped <= 2:
-                continue
-            rows.append(line.split("\t"))
+            if in_data:
+                rows.append(line.split("\t"))
         return rows
     except Exception:
         return []
@@ -691,12 +694,82 @@ def inject_jd_into_dat(dat_path: Path, seq_path: Path,
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Frame-directory resolution (tolerant to capture-tool layouts)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FITS_GLOBS = ("*.fit", "*.fits", "*.fts")
+
+
+def _dir_has_fits(d: Path) -> bool:
+    """True if *d* directly contains at least one FITS file."""
+    return d.is_dir() and any(next(iter(d.glob(g)), None) for g in _FITS_GLOBS)
+
+
+def list_fits(d: Path) -> list[Path]:
+    """All FITS files directly inside *d* (any common extension), sorted by name."""
+    out: list[Path] = []
+    for g in _FITS_GLOBS:
+        out += d.glob(g)
+    return sorted(out)
+
+
+def resolve_frame_dir(session: Path, names) -> Optional[Path]:
+    """Locate the directory holding frames of a given type under *session*.
+
+    Tolerant to two capture layouts:
+      • flat   — session/<name>/*.fits              (legacy Seestar dump)
+      • nested — session/<Name>/<subfolder>/*.fits  (Argos: a per-filter
+                 subfolder, e.g. Lights/IR/, Darks/Dark/, Biases/Dark/)
+
+    *names* is a single folder name or a list of accepted names, matched
+    case-insensitively (e.g. ["lights", "light"]). When the top folder holds
+    frames directly it is returned as-is; otherwise the populated subfolder is
+    returned — the richest one when several exist (multiple filters). Returns
+    None when nothing is found.
+    """
+    if isinstance(names, str):
+        names = [names]
+    wanted = {n.lower() for n in names}
+    if not session.is_dir():
+        return None
+
+    top = next(
+        (c for c in sorted(session.iterdir())
+         if c.is_dir() and c.name.lower() in wanted),
+        None,
+    )
+    if top is None:
+        return None
+    if _dir_has_fits(top):
+        return top
+
+    subs = [s for s in sorted(top.iterdir()) if _dir_has_fits(s)]
+    if not subs:
+        return None
+    return max(subs, key=lambda s: len(list_fits(s)))
+
+
+def fits_exptime(d: Path) -> Optional[float]:
+    """Exposure time (s) of the first FITS in *d*, or None if unreadable."""
+    for fit in list_fits(d)[:1]:
+        hdr = read_fits_header(fit)
+        for key in ("EXPTIME", "EXPOSURE"):
+            v = hdr.get(key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    pass
+    return None
+
+
 def get_gain_eadu(lights_dir: Path) -> float:
     """Read real gain in e-/ADU from the first FITS file in lights/.
     GAIN=200 on a Seestar is ISO-equivalent, not e-/ADU.
     Returns 1.0 as a safe fallback.
     """
-    for fit in sorted(lights_dir.glob("*.fit"))[:1]:
+    for fit in list_fits(lights_dir)[:1]:
         hdr = read_fits_header(fit)
         for key in ("EGAIN", "EPERDN", "GAIN_E", "CCDGAIN"):
             v = hdr.get(key)
@@ -722,12 +795,146 @@ def get_gain_eadu(lights_dir: Path) -> float:
 # AAVSO export
 # ─────────────────────────────────────────────────────────────────────────────
 
+def build_airmass_map(proc: Path, stem: str, fixlen: int) -> list[tuple[float, float]]:
+    """Build a per-frame (JD, airmass) table from the registered FITS headers.
+
+    The Seestar/Argos capture tool writes an AIRMASS keyword in each frame header;
+    DATE-OBS gives the JD axis. Returns a list sorted by JD, used to fill the AAVSO
+    AMASS column by nearest-JD match. Empty if no frame exposes AIRMASS.
+    """
+    amap: list[tuple[float, float]] = []
+    for fit in sorted(proc.glob(f"{stem}_*.fit")):
+        hdr = read_fits_header(fit)
+        am  = hdr.get("AIRMASS")
+        if am is None:
+            continue
+        try:
+            am = float(am)
+        except (ValueError, TypeError):
+            continue
+        dobs = hdr.get("DATE-OBS") or hdr.get("DATE_OBS")
+        if not dobs:
+            continue
+        jd = dateobs_to_jd(str(dobs))
+        if jd is not None:
+            amap.append((jd, am))
+    amap.sort()
+    return amap
+
+
+def _airmass_at(jd: float, amap: list[tuple[float, float]],
+                tol_days: float) -> Optional[float]:
+    """Nearest airmass to *jd* within *tol_days*, or None if no frame is close enough."""
+    if not amap:
+        return None
+    best_jd, best_am = min(amap, key=lambda r: abs(r[0] - jd))
+    return best_am if abs(best_jd - jd) <= tol_days else None
+
+
+def _robust_sigma(values: list[float]) -> float:
+    """MAD-based robust standard deviation (1.4826 × median absolute deviation)."""
+    if not values:
+        return 0.0
+    med = statistics.median(values)
+    mad = statistics.median([abs(v - med) for v in values])
+    return 1.4826 * mad
+
+
+def estimate_lightcurve_scatter(jd_mag: list[tuple[float, float]]) -> Optional[float]:
+    """Estimate the real per-point photometric scatter of a light curve, in mag.
+
+    Uses robust second differences d2 = m[i-1] - 2·m[i] + m[i+1], which cancel any
+    locally-linear trend, so a smoothly-varying star (e.g. RR Lyr) doesn't bias the
+    estimate. Independent per-point noise σ propagates as Var(d2)=6σ², hence σ =
+    robust_sigma(d2)/√6. Residual curvature only *inflates* the estimate, so the
+    result is conservative. Returns σ (mag), or None if fewer than 10 usable points.
+    """
+    pts = sorted((jd, m) for jd, m in jd_mag
+                 if not math.isnan(jd) and not math.isnan(m))
+    if len(pts) < 10:
+        return None
+    d2 = [pts[i - 1][1] - 2 * pts[i][1] + pts[i + 1][1]
+          for i in range(1, len(pts) - 1)]
+    return _robust_sigma(d2) / math.sqrt(6.0)
+
+
+def apply_error_floor(dat: Path,
+                      manual_floor: Optional[float] = None) -> Optional[dict]:
+    """Lift the error column of a light_curve.dat to a realistic value, in place.
+
+    Siril reports only the formal photon-noise error, which underestimates the true
+    scatter (flat-field residuals, scintillation, imperfect dark/flat calibration —
+    none of which enter the photon budget). This measures the actual scatter σ_real
+    and rewrites each point's error as (model B, quadrature):
+
+        err' = √(err² + σ_syst²),   σ_syst = √(max(0, σ_real² − median(err)²))
+
+    so every point keeps its own photon noise and gains a shared systematic floor.
+
+    If *manual_floor* is given it is used directly as σ_syst (measurement skipped).
+    Returns {sigma_real, median_err, sigma_syst, n} or None if not applied.
+    """
+    try:
+        lines = dat.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+
+    # (line_index, err_col, jd, mag, err, parts) for each data row
+    parsed: list[tuple[int, int, float, float, float, list]] = []
+    for idx, line in enumerate(lines):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        try:
+            jd_i = next(i for i, p in enumerate(parts) if float(p) > 2_400_000)
+            jd   = float(parts[jd_i])
+            mag  = float(parts[jd_i + 1])
+            err  = float(parts[jd_i + 2])
+        except (ValueError, StopIteration, IndexError):
+            continue
+        parsed.append((idx, jd_i + 2, jd, mag, err, parts))
+
+    good = [(jd, mag, err) for (_i, _e, jd, mag, err, _p) in parsed
+            if not math.isnan(mag) and not math.isnan(err)]
+    if not good or (len(good) < 10 and manual_floor is None):
+        return None
+
+    med_err = statistics.median([e for _j, _m, e in good])
+    if manual_floor is not None:
+        sigma_syst = max(0.0, float(manual_floor))
+        sigma_real = math.sqrt(med_err ** 2 + sigma_syst ** 2)
+    else:
+        sigma_real = estimate_lightcurve_scatter([(j, m) for j, m, _e in good])
+        if sigma_real is None:
+            return None
+        sigma_syst = math.sqrt(max(0.0, sigma_real ** 2 - med_err ** 2))
+
+    if sigma_syst > 0:
+        for idx, err_col, jd, mag, err, parts in parsed:
+            if math.isnan(err) or err_col >= len(parts):
+                continue
+            parts[err_col] = f"{math.sqrt(err ** 2 + sigma_syst ** 2):.6g}"
+            lines[idx] = " ".join(parts)
+        note = (f"# MERR includes systematic error floor: sigma_syst={sigma_syst:.4f} mag "
+                f"(measured scatter={sigma_real:.4f}, formal median={med_err:.4f}; "
+                f"err = sqrt(formal^2 + sigma_syst^2))")
+        lines.insert(1 if lines and lines[0].startswith("#") else 0, note)
+        dat.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    return {"sigma_real": sigma_real, "median_err": med_err,
+            "sigma_syst": sigma_syst, "n": len(good)}
+
+
 def export_aavso(dat: Path, out: Path, name: str,
                  filt_code: str = "CV", filt_note: str = "",
-                 merr_max: float = 0.5) -> list:
+                 merr_max: float = 0.5,
+                 airmass_map: Optional[list[tuple[float, float]]] = None) -> list:
     """Export light curve to AAVSO Extended format.
 
     Filters NaN magnitudes and MERR > merr_max.
+    When *airmass_map* (a sorted list of (JD, airmass) from build_airmass_map) is
+    provided, the AMASS column is filled by nearest-JD match; otherwise it is "na".
     Returns list of (jd, mag, err) rows written.
     """
     rows = []
@@ -752,6 +959,14 @@ def export_aavso(dat: Path, out: Path, name: str,
     if not rows:
         return []
 
+    # Airmass match tolerance: half the median frame cadence, so each light-curve
+    # point maps to exactly one frame. Falls back to 60 s for a sparse/1-point map.
+    airmass_tol = 60.0 / 86400.0
+    if airmass_map and len(airmass_map) >= 2:
+        spacings = [airmass_map[i + 1][0] - airmass_map[i][0]
+                    for i in range(len(airmass_map) - 1)]
+        airmass_tol = statistics.median(spacings) / 2.0
+
     notes = f"seestar_s30pro|{filt_note}" if filt_note else "seestar_s30pro"
     with open(out, "w", newline="") as f:
         # Write header directly — csv.writer would quote "#DELIM=," (contains comma)
@@ -764,9 +979,11 @@ def export_aavso(dat: Path, out: Path, name: str,
         w.writerow(["NAME","DATE","MAG","MERR","FILT","TRANS","MTYPE",
                     "CNAME","CMAG","KNAME","KMAG","AMASS","GROUP","CHART","NOTES"])
         for jd, mag, err in rows:
+            am = _airmass_at(jd, airmass_map, airmass_tol) if airmass_map else None
+            amass = f"{am:.4f}" if am is not None else "na"
             w.writerow([name, f"{jd:.6f}", f"{mag:.4f}", f"{err:.4f}",
                         filt_code, "NO", "DIFF",
-                        "ENSEMBLE", "na", "na", "na", "na", "1", "na", notes])
+                        "ENSEMBLE", "na", "na", "na", amass, "1", "na", notes])
     return rows
 
 
@@ -908,6 +1125,19 @@ def run_pipeline(config: dict,
       filt_code  (str)              AAVSO filter code, e.g. "CV"
       filt_note  (str)              extra note, e.g. "LP_filter_Seestar_S30Pro"
       runner     (SirilRunner)
+      phot_aperture  (float)        setphot forced-aperture radius px (def 10)
+      phot_inner     (float)        sky-annulus inner radius px (def 20)
+      phot_outer     (float)        sky-annulus outer radius px (def 30)
+      phot_dyn_ratio (float)        dynamic aperture = 0.5*FWHM*ratio (def 4.0)
+      phot_min_val   (float)        min valid pixel value (def -1000; registered
+                                    frames are background-subtracted so sky sits
+                                    slightly below 0 on the 16-bit ADU scale)
+      phot_max_val   (float)        max valid pixel value / saturation (def 60000)
+      error_floor    (bool)         add a systematic error floor to MERR so it
+                                    reflects the real scatter, not just Siril's
+                                    formal photon noise (def True)
+      error_floor_mag (Optional[float]) fixed σ_syst (mag) to add in quadrature
+                                    instead of measuring it from the light curve
 
     Callbacks on_log/on_progress/on_done are called from the pipeline thread.
     """
@@ -916,17 +1146,47 @@ def run_pipeline(config: dict,
     comp_stars = list(config.get("comp_stars", []))
     nstars     = config.get("nstars", 10)
     start_step = config.get("start_step", 1)
-    dark_dir   = config.get("dark_dir")
-    flat_dir   = config.get("flat_dir")
-    bias_dir   = config.get("bias_dir")
     filt_code  = config.get("filt_code", "CV")
     filt_note  = config.get("filt_note", "")
     runner     = config["runner"]
 
+    # ── Photometry (setphot) parameters — user-tunable ────────────────────────
+    # See Step 5 for how these map onto Siril's aperture-photometry model.
+    # Defaults reproduce the historical hard-coded values.
+    phot = {
+        "aperture":  float(config.get("phot_aperture",  10.0)),
+        "inner":     float(config.get("phot_inner",     20.0)),
+        "outer":     float(config.get("phot_outer",     30.0)),
+        "dyn_ratio": float(config.get("phot_dyn_ratio",  4.0)),
+        "min_val":   float(config.get("phot_min_val", -1000.0)),
+        "max_val":   float(config.get("phot_max_val", 60000.0)),
+    }
+
     proc    = session / "process"
-    lights  = session / "lights"
     masters = proc / "masters"
     proc.mkdir(exist_ok=True)
+
+    # ── Resolve the lights directory (tolerant to layout) ─────────────────────
+    #   legacy Seestar dump : session/lights/*.fits
+    #   Argos               : session/Lights/<filter>/*.fits
+    lights = resolve_frame_dir(session, ["lights", "light"]) or (session / "lights")
+
+    # ── Calibration frames: honour an explicit dir, else auto-detect ──────────
+    def _resolve_calib(cfg_dir, names):
+        if cfg_dir is not None:
+            p = Path(cfg_dir)
+            if _dir_has_fits(p):
+                return p
+            # user pointed at a container (e.g. Darks/) — descend to the frames
+            subs = [s for s in sorted(p.iterdir()) if _dir_has_fits(s)] if p.is_dir() else []
+            if subs:
+                return max(subs, key=lambda s: len(list_fits(s)))
+            return p  # leave as-is; the calibration step will report the failure
+        return resolve_frame_dir(session, names)
+
+    dark_dir = _resolve_calib(config.get("dark_dir"), ["darks", "dark"])
+    flat_dir = _resolve_calib(config.get("flat_dir"), ["flats", "flat"])
+    bias_dir = _resolve_calib(config.get("bias_dir"), ["biases", "bias"])
 
     # ── Per-star output subfolder (results/<safe_name>/) ──────────────────────
     safe        = star["name"].replace(" ", "_").replace("/", "-")
@@ -958,6 +1218,24 @@ def run_pipeline(config: dict,
         except Exception:
             pass
         _orig_on_done(ok, msg)
+
+    # ── Report the resolved input directories ─────────────────────────────────
+    if lights.is_dir():
+        on_log(f"Lights: {lights.relative_to(session) if session in lights.parents else lights}"
+               f"  ({len(list_fits(lights))} frames)")
+    else:
+        on_log(f"WARNING: lights directory not found under {session}")
+    for label, d in [("Darks", dark_dir), ("Flats", flat_dir), ("Bias", bias_dir)]:
+        if d is not None and _dir_has_fits(d):
+            on_log(f"{label}: {d}  ({len(list_fits(d))} frames)")
+
+    # Warn on dark/light exposure mismatch — dark subtraction needs matching t_exp.
+    if dark_dir is not None and _dir_has_fits(dark_dir):
+        t_light = fits_exptime(lights) if lights.is_dir() else None
+        t_dark  = fits_exptime(dark_dir)
+        if t_light and t_dark and abs(t_light - t_dark) > 0.5:
+            on_log(f"WARNING: dark exposure {t_dark:g}s ≠ light exposure {t_light:g}s — "
+                   "dark subtraction may be inaccurate.")
 
     focal = SEESTAR["focal"]
     pixsz = SEESTAR["pixsz"]
@@ -991,21 +1269,35 @@ def run_pipeline(config: dict,
 
     # ── Steps 0–3 (only when starting from step 1) ───────────────────────────
     if start_step == 1:
-        has_calib = any([dark_dir, flat_dir, bias_dir])
+        calib_dirs = {
+            k: d for k, d in [("dark", dark_dir), ("flat", flat_dir), ("bias", bias_dir)]
+            if d is not None and _dir_has_fits(d)
+        }
+        has_calib = bool(calib_dirs)
 
         bad_out = lights / f'"{proc}"'
         if bad_out.exists():
             shutil.rmtree(bad_out, ignore_errors=True)
             on_log("Cleaned up misplaced output directory from a previous run.")
 
+        # ── Step 1: link raw lights → light_ sequence ─────────────────────────
+        # Must run before calibration: `calibrate` operates on the light_ sequence.
+        on_progress(15, "Linking frames…")
+        on_log("─── Step 1: link lights → sequence ───")
+        if not runner.run_script(proc, [
+            f'cd "{lights}"',
+            f'link light -out={proc}',
+        ], "_s1_link.ssf"):
+            on_done(False, "Step 1 failed (link lights)")
+            return
+
+        # ── Step 0: build calibration masters & calibrate light_ → pp_light_ ──
         if has_calib:
             masters.mkdir(exist_ok=True)
-            on_progress(5, "Building calibration masters…")
+            on_progress(22, "Building calibration masters…")
             on_log("─── Step 0: calibration frames ───")
             calib_cmds = []
-            for kind, src in [("dark", dark_dir), ("flat", flat_dir), ("bias", bias_dir)]:
-                if src is None:
-                    continue
+            for kind, src in calib_dirs.items():
                 norm = "-nonorm" if kind in ("dark", "bias") else "-norm=mul"
                 calib_cmds += [
                     f'cd "{src}"',
@@ -1013,13 +1305,15 @@ def run_pipeline(config: dict,
                     f'cd "{masters}"',
                     f'stack {kind}_ rej 3 3 {norm} -out=master_{kind}',
                 ]
-                on_log(f"  → stacking {kind}s from {src.name}/")
+                on_log(f"  → stacking {kind}s from {src}/")
             cal_flags = " ".join(
                 f"-{k}=masters/master_{k}"
-                for k, d in [("bias", bias_dir), ("dark", dark_dir), ("flat", flat_dir)]
-                if d is not None
+                for k in ("bias", "dark", "flat") if k in calib_dirs
             )
-            calib_cmds += [f'cd "{proc}"', f"calibrate light_ {cal_flags} -cc=banding"]
+            # Cosmetic correction detects hot/cold pixels from the master dark;
+            # it requires -dark, so only enable it when a dark is present.
+            cc = " -cc=dark" if "dark" in calib_dirs else ""
+            calib_cmds += [f'cd "{proc}"', f"calibrate light_ {cal_flags}{cc}"]
             if not runner.run_script(proc, calib_cmds, "_s0_calibrate.ssf"):
                 on_done(False, "Step 0 failed (calibration)")
                 return
@@ -1028,16 +1322,14 @@ def run_pipeline(config: dict,
             on_log("No calibration frames — proceeding with raw lights.")
             seq = "light_"
 
-        on_progress(15, "Linking frames & computing registration…")
-        on_log("─── Step 1: link lights → sequence ───")
+        # ── Step 2: register the (calibrated) sequence ────────────────────────
+        on_progress(30, "Computing registration…")
         on_log("─── Step 2: register -2pass ───")
         if not runner.run_script(proc, [
-            f'cd "{lights}"',
-            f'link light -out={proc}',
             f'cd "{proc}"',
             f"register {seq} -2pass",
-        ], "_s12_link_register.ssf"):
-            on_done(False, "Step 1/2 failed (link / register)")
+        ], "_s2_register.ssf"):
+            on_done(False, "Step 2 failed (register)")
             return
 
         on_progress(45, "Aligning frames…")
@@ -1308,9 +1600,22 @@ def run_pipeline(config: dict,
     if bayer_stripped:
         on_log(f"BAYERPAT stripped from {len(bayer_stripped)} frames (date_obs fix)")
 
+    # Dynamic aperture = 0.5 * FWHM * dyn_ratio (Siril photometry.c). A frame's
+    # PSF fit fails with "inner radii too small (N required)" when that dynamic
+    # aperture reaches `inner`, i.e. FWHM >= 2*inner/dyn_ratio px. Raise inner/
+    # outer (or lower dyn_ratio) to keep marginal frames; raise max_val when the
+    # comparison stars saturate ("reference stars ... out of valid pixel range").
+    setphot_cmd = (
+        f"setphot -aperture={phot['aperture']:g} -inner={phot['inner']:g} "
+        f"-outer={phot['outer']:g} -dyn_ratio={phot['dyn_ratio']:g} "
+        f"-min_val={phot['min_val']:g} -max_val={phot['max_val']:g} -gain={gain}"
+    )
+    on_log(f"Photometry: aperture={phot['aperture']:g} inner={phot['inner']:g} "
+           f"outer={phot['outer']:g} dyn_ratio={phot['dyn_ratio']:g} "
+           f"valid=[{phot['min_val']:g},{phot['max_val']:g}]")
     ok = runner.run_script(proc, [
         f'cd "{proc}"',
-        f"setphot -aperture=10 -inner=20 -outer=30 -dyn_ratio=4.0 -gain={gain}",
+        setphot_cmd,
         lc_cmd,
     ], "_s5_phot.ssf")
 
@@ -1348,9 +1653,32 @@ def run_pipeline(config: dict,
             on_log("JD normalized to absolute JD ✓")
         shutil.copy2(lc_dat, out_dat)
 
+        # Realistic uncertainties: Siril's formal error underestimates the true
+        # scatter (flat/scintillation/calibration systematics absent from the photon
+        # budget). Lift MERR to sqrt(formal^2 + sigma_syst^2) from the measured scatter.
+        # All downstream exports read out_dat, so correcting it once is enough.
+        if config.get("error_floor", True):
+            ef = apply_error_floor(out_dat, config.get("error_floor_mag"))
+            if ef and ef["sigma_syst"] > 0:
+                on_log(f"Error floor: measured scatter {ef['sigma_real']:.4f} mag vs "
+                       f"formal median {ef['median_err']:.4f} → added σ_syst="
+                       f"{ef['sigma_syst']:.4f} mag in quadrature to MERR")
+            elif ef:
+                on_log("Error floor: formal errors already consistent with scatter — "
+                       "MERR unchanged")
+            else:
+                on_log("Error floor: too few points to measure scatter — MERR unchanged")
+
         # AAVSO extended format (differential V-C, ENSEMBLE comp)
+        # Airmass per point comes from the registered frame headers (AIRMASS keyword)
+        airmass_map = build_airmass_map(proc, stem, seq_fixlen)
+        if airmass_map:
+            on_log(f"Airmass: read from {len(airmass_map)} frame headers")
+        else:
+            on_log("Airmass: no AIRMASS keyword in frame headers — AMASS left as 'na'")
         rows = export_aavso(out_dat, out_csv, star["name"],
-                            filt_code=filt_code, filt_note=filt_note)
+                            filt_code=filt_code, filt_note=filt_note,
+                            airmass_map=airmass_map)
         n_valid = len(rows)
         n_total = sum(1 for ln in out_dat.read_text().splitlines()
                       if ln and not ln.startswith("#"))

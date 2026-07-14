@@ -189,10 +189,12 @@ class TestSkyToPixelRotated(unittest.TestCase):
         self.assertAlmostEqual(px, self.HDR["CRPIX1"], places=3)
         self.assertAlmostEqual(py, self.HDR["CRPIX2"], places=3)
 
-    def test_edge_star_in_frame(self):
-        # NSVS J0941171+685517: 3.9° from field centre in RA but still within
-        # the rotated frame due to the ~42° position angle.
-        self.assertTrue(self._in_frame(145.3213, 68.9214))
+    def test_edge_star_out_of_frame(self):
+        # NSVS J0941171+685517: 3.9° from field centre in RA. Under the correct
+        # WCS it projects to disp-x ≈ -8 (off the left edge), so it is NOT in the
+        # frame. (Cross-check: astropy wcs_world2pix agrees to <0.01 px, and
+        # test_nsvs_edge_star_excluded excludes the same star from the safe circle.)
+        self.assertFalse(self._in_frame(145.3213, 68.9214))
 
     def test_apass_comps_near_edge_star_excluded(self):
         # APASS stars found within 1.5° of the edge star project BELOW the frame

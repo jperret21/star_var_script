@@ -24,8 +24,7 @@ Seestar FITS frames
   photometry.csv  ·  fwhm.csv  ·  StarName_aavso.csv
     ↓
   varstar_postprod/plot_lightcurve.py  ·  analysis.ipynb
-    ↓
-  publication-quality figures
+
 ```
 
 ## Repository
