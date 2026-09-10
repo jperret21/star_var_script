@@ -7,7 +7,7 @@ Automated pipeline for variable star differential photometry with the **ZWO Sees
 ## Features
 
 - **Automatic target discovery** — queries VizieR/VSX to find all known variable stars in the field
-- **Ensemble differential photometry** — APASS comparison stars fetched automatically from VizieR
+- **Ensemble differential photometry** — APASS comparison stars fetched automatically from VizieR, or the AAVSO VSP comparison and check stars chosen in [Argos](https://github.com/jperret21/argos) for an Argos session
 - **Approximate apparent V magnitude** — computed from APASS catalog magnitudes of comp stars
 - **Per-frame FWHM** — extracted from the Siril registration sequence and exported to CSV
 - **AAVSO-ready export** — AAVSO Extended Format CSV, ready for WebObs submission

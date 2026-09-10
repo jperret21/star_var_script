@@ -15,11 +15,15 @@ from pipeline import (
     FILTER_OPTIONS,
     VERSION,
     _parse_comp_csv,
+    _read_lc_dat,
+    argos_selection_stars,
     ensemble_zero_point,
     export_aavso,
+    load_argos_selection,
     siril_loaded_comps,
     siril_refs_used,
     truncate_comp_csv,
+    write_nina_csv,
 )
 from tests.aavso_spec import FILTERS, aavso_violations
 
@@ -301,6 +305,109 @@ class TestExportAavso(unittest.TestCase):
     def test_every_filter_option_is_an_aavso_code(self):
         for label, (code, _) in FILTER_OPTIONS.items():
             self.assertIn(code, FILTERS, label)
+
+    def test_check_star_and_vsp_chart(self):
+        dat = _write_dat(self.tmp / "lc.dat", [
+            "2460325.438000 -0.3450 0.0230",
+            "2460325.439000 -0.3670 0.0310",
+        ])
+        out = self.tmp / "aavso.csv"
+        _export(dat, out, comp_source="AAVSO VSP", chart="X42585ESI",
+                check=("000-BJV-171", {2460325.438: 12.4567}))
+        rows = self._read_csv_rows(out)
+        self.assertEqual((rows[0]["KNAME"], rows[0]["KMAG"]), ("000-BJV-171", "12.457"))
+        self.assertEqual((rows[1]["KNAME"], rows[1]["KMAG"]), ("na", "na"))  # no check point
+        self.assertEqual(rows[0]["CHART"], "X42585ESI")
+        self.assertIn("5 AAVSO VSP comparison stars", rows[0]["NOTES"])
+        self.assertIn("check star 000-BJV-171", rows[0]["NOTES"])
+        self.assertEqual(aavso_violations(out), [])
+
+    def test_unknown_chart_is_na(self):
+        dat = _write_dat(self.tmp / "lc.dat", ["2460325.438000 -0.3450 0.0230"])
+        out = self.tmp / "aavso.csv"
+        _export(dat, out, chart=None)
+        self.assertEqual(self._read_csv_rows(out)[0]["CHART"], "na")
+
+
+def _manifest(comps, checks=(), target=(148.619236, 69.222850)):
+    """An Argos photometry_selection.json, as argos TargetSet writes it."""
+    def rec(auid, ra, dec, v=None, chart="X42585ESI"):
+        return {"auid": auid, "name": auid, "ra_deg_j2000": ra, "dec_deg_j2000": dec,
+                "catalogue_source": "vsp_auto",
+                "catalogue_magnitudes": {} if v is None else {"V": v, "B": v + 0.6},
+                "catalogue_chart_id": chart}
+    return {"schema": 1, "object_name": "ES UMa",
+            "targets": [{"name": "ES UMa", "auid": "000-BCK-001",
+                         "ra_deg_j2000": target[0], "dec_deg_j2000": target[1]}],
+            "comparison_stars": [rec(*c) for c in comps],
+            "check_stars": [rec(*c) for c in checks]}
+
+
+class TestArgosSelection(unittest.TestCase):
+    STAR = {"name": "V* ES UMa", "ra": 148.619236, "dec": 69.222850, "mag": 12.0}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_comps_check_and_chart(self):
+        sel = _manifest(comps=[("000-AAA-001", 148.7, 69.3, 11.4),
+                               ("000-AAA-002", 148.5, 69.1, 12.1),
+                               ("000-AAA-003", 148.6, 69.2, None),       # no V
+                               ("000-AAA-004", 160.0, 69.2, 12.0)],      # off frame
+                        checks=[("000-AAA-005", 148.8, 69.2, 12.6)])
+        comps, check, chart = argos_selection_stars(
+            sel, self.STAR, in_frame=lambda ra, dec: ra < 150)
+        self.assertEqual([c[0] for c in comps], ["000-AAA-001", "000-AAA-002"])
+        self.assertEqual(comps[0][3], 11.4)
+        self.assertEqual(check, ("000-AAA-005", 148.8, 69.2))
+        self.assertEqual(chart, "X42585ESI")
+
+    def test_mixed_charts_leave_no_chart(self):
+        sel = _manifest(comps=[("000-AAA-001", 148.7, 69.3, 11.4, "X1"),
+                               ("000-AAA-002", 148.5, 69.1, 12.1, "X2")])
+        _, check, chart = argos_selection_stars(sel, self.STAR, in_frame=lambda *_: True)
+        self.assertIsNone(chart)
+        self.assertIsNone(check)
+
+    def test_other_target_is_refused(self):
+        sel = _manifest(comps=[("000-AAA-001", 148.7, 69.3, 11.4),
+                               ("000-AAA-002", 148.5, 69.1, 12.1)],
+                        target=(150.0, 69.0))
+        with self.assertRaisesRegex(ValueError, "is for ES UMa"):
+            argos_selection_stars(sel, self.STAR, in_frame=lambda *_: True)
+
+    def test_too_few_comps_is_refused(self):
+        sel = _manifest(comps=[("000-AAA-001", 148.7, 69.3, 11.4)])
+        with self.assertRaisesRegex(ValueError, "only 1"):
+            argos_selection_stars(sel, self.STAR, in_frame=lambda *_: True)
+
+    def test_load_and_nina_round_trip(self):
+        path = self.tmp / "photometry_selection.json"
+        path.write_text(__import__("json").dumps(_manifest(
+            comps=[("000-AAA-001", 148.7, 69.3, 11.4), ("000-AAA-002", 148.5, 69.1, 12.1)])))
+        sel = load_argos_selection(path)
+        comps, _, _ = argos_selection_stars(sel, self.STAR, in_frame=lambda *_: True)
+        nina = self.tmp / "comp_stars.csv"
+        write_nina_csv(nina, ("V* ES UMa", 148.619236, 69.22285, 12.0), comps)
+        self.assertTrue(nina.read_text().splitlines()[1].startswith("Target,V* ES UMa,"))
+        self.assertEqual(_parse_comp_csv(nina),
+                         [("Comp2", "000-AAA-001", 11.4), ("Comp2", "000-AAA-002", 12.1)])
+        self.assertIsNone(load_argos_selection(self.tmp / "missing.json"))
+
+    def test_siril_log_names_comp2_stars(self):
+        comps = [("Comp2", "000-AAA-001", 11.4), ("Comp2", "000-AAA-002", 12.1)]
+        out = ["log: star 000-AAA-002 [Comp2] added as a reference star"]
+        self.assertEqual(siril_loaded_comps(out, comps), comps[1:])
+
+    def test_read_lc_dat(self):
+        dat = _write_dat(self.tmp / "lc.dat", ["2460325.438000 -0.3450 0.0230",
+                                               "2460325.439000 nan 9.999"])
+        rows = _read_lc_dat(dat)
+        self.assertEqual(rows[0], (2460325.438, -0.345, 0.023))
+        self.assertTrue(math.isnan(rows[1][1]))
 
 
 class TestEnsembleZeroPoint(unittest.TestCase):

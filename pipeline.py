@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import datetime
+import json
 import math
 import os
 import platform
@@ -567,6 +568,115 @@ def siril_loaded_comps(output: list[str],
     return loaded
 
 
+# ── Argos hand-off ────────────────────────────────────────────────────────────
+# Argos (the acquisition app) writes the comparison and check stars it chose —
+# from the target's AAVSO VSP sequence — to photometry_selection.json in its
+# session folder.
+
+ARGOS_SELECTION_FILE = "photometry_selection.json"
+_SAME_STAR_ARCSEC = 30.0
+
+
+def load_argos_selection(path: Path) -> Optional[dict]:
+    """An Argos photometry_selection.json, or None if it cannot be read."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _separation_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    dra = (ra1 - ra2) * math.cos(math.radians((dec1 + dec2) / 2))
+    return math.hypot(dra, dec1 - dec2) * 3600.0
+
+
+def argos_selection_stars(sel: dict, star: dict,
+                          in_frame: Callable[[float, float], bool]
+                          ) -> tuple[list[tuple[str, float, float, float]],
+                                     Optional[tuple[str, float, float]],
+                                     Optional[str]]:
+    """Comparison and check stars of an Argos selection, for *star*.
+
+    Returns (comps, check, chart_id): comps as (name, ra, dec, V) — the
+    comparison stars inside the frame with a catalogue V magnitude —, the first
+    in-frame check star as (name, ra, dec) or None, and the VSP chart shared by
+    the comps (None unless they all name the same one). Names are AUIDs.
+
+    Raises ValueError, with the reason, when the selection cannot be used: it
+    is for another target, or fewer than two comparison stars remain.
+    """
+    targets = sel.get("targets") or []
+    if not targets:
+        raise ValueError("it has no target")
+    t = targets[0]
+    try:
+        sep = _separation_arcsec(float(t["ra_deg_j2000"]), float(t["dec_deg_j2000"]),
+                                 star["ra"], star["dec"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("its target has no coordinates") from None
+    if sep > _SAME_STAR_ARCSEC:
+        raise ValueError(f"it is for {t.get('name') or 'another star'}, "
+                         f"{sep:.0f}\" from {star['name']}")
+
+    def usable(rec: dict) -> Optional[tuple[str, float, float]]:
+        name = str(rec.get("auid") or "").strip()
+        try:
+            ra, dec = float(rec["ra_deg_j2000"]), float(rec["dec_deg_j2000"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not name or len(name) > 20 or "," in name or not in_frame(ra, dec):
+            return None
+        return name, ra, dec
+
+    comps, charts = [], set()
+    for rec in sel.get("comparison_stars") or []:
+        pos = usable(rec)
+        vmag = (rec.get("catalogue_magnitudes") or {}).get("V")
+        if pos is None or not isinstance(vmag, (int, float)) or not math.isfinite(vmag):
+            continue
+        comps.append((*pos, float(vmag)))
+        charts.add(rec.get("catalogue_chart_id") or None)
+    if len(comps) < 2:
+        raise ValueError(f"only {len(comps)} of its comparison stars are in the frame "
+                         "with an AUID and a V magnitude")
+    check = next((pos for rec in sel.get("check_stars") or []
+                  if (pos := usable(rec)) is not None), None)
+    chart_id = charts.pop() if len(charts) == 1 else None
+    return comps, check, chart_id
+
+
+def write_nina_csv(path: Path, target: tuple[str, float, float, float],
+                   comps: list[tuple[str, float, float, float]]) -> None:
+    """A light_curve -ninastars list: the target, then 'Comp2' (AAVSO) stars.
+
+    Stars are (name, ra, dec, V); Siril only measures, never uses, the target V.
+    """
+    name, ra, dec, mag = target
+    lines = ["type,name,ra,dec,mag",
+             f"Target,{name.replace(',', ' ')},{ra:.8f},{dec:.8f},{mag:.3f}"]
+    lines += [f"Comp2,{n},{r:.8f},{d:.8f},{v:.3f}" for n, r, d, v in comps]
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _read_lc_dat(dat: Path) -> list[tuple[float, float, float]]:
+    """(JD, V-C, error) rows of a light_curve.dat; unparseable lines skipped."""
+    rows = []
+    with open(dat) as f:
+        for line in f:
+            parts = line.split()
+            if not parts or parts[0].startswith("#"):
+                continue
+            try:
+                vals = [float(p) for p in parts]
+                jd_i = next(i for i, v in enumerate(vals) if v > 2_400_000)
+                err = vals[jd_i + 2] if len(vals) > jd_i + 2 else 0.0
+                rows.append((vals[jd_i], vals[jd_i + 1], err))
+            except (ValueError, StopIteration, IndexError):
+                continue
+    return rows
+
+
 def export_fwhm_csv(seq_path: Path, proc: Path, stem: str,
                     fixlen: int, out: Path,
                     plate_scale_arcsec: float = 1.035) -> int:
@@ -995,13 +1105,20 @@ def export_aavso(dat: Path, out: Path, name: str, *,
                  obscode: str, ensemble_vmag: Optional[float], n_comps: int,
                  filt_code: str = "CV", filt_note: str = "",
                  merr_max: float = 0.5,
-                 airmass_map: Optional[list[tuple[float, float]]] = None) -> list:
+                 airmass_map: Optional[list[tuple[float, float]]] = None,
+                 comp_source: str = AAVSO_CHART, chart: Optional[str] = AAVSO_CHART,
+                 check: Optional[tuple[str, dict[float, float]]] = None) -> list:
     """Export light curve to AAVSO Extended format.
 
     Spec: https://www.aavso.org/aavso-extended-file-format. Rows are ensemble
     photometry: MAG = (V-C) + ensemble_vmag, MTYPE=STD, CNAME=ENSEMBLE, CMAG=na,
     TRANS=NO. The column-name line starts with '#': WebObs reads every other
     line as an observation.
+
+    *comp_source* names where the comparison stars come from (NOTES) and
+    *chart* is the CHART field: the VSP chart ID for an AAVSO sequence, the
+    catalogue otherwise, None for unknown. *check* is (KNAME, {JD rounded to
+    1e-6: KMAG}), the check star's ensemble magnitude on the same frames.
 
     Raises ValueError, without writing *out*, when the file could not be
     submitted: no observer code, no ensemble magnitude (MAG would be the
@@ -1056,10 +1173,20 @@ def export_aavso(dat: Path, out: Path, name: str, *,
                     for i in range(len(airmass_map) - 1)]
         airmass_tol = statistics.median(spacings) / 2.0
 
+    def field(value: Optional[str]) -> Optional[str]:
+        """*value* as a CHART/KNAME field: at most 20 characters, no comma."""
+        value = (value or "").strip()
+        return value if value and len(value) <= 20 and "," not in value else None
+
+    chart_field = field(chart) or "na"
+    kname = field(check[0]) if check else None
+    kmags = check[1] if kname else {}
+
     # The spec asks for information on self-chosen comparison stars in NOTES.
     # No field may contain the delimiter.
-    notes = (f"Seestar S30 Pro; Siril ensemble of {n_comps} {AAVSO_CHART} "
-             f"comparison stars (flux-mean V={ensemble_vmag:.3f}); no check star")
+    notes = (f"Seestar S30 Pro; Siril ensemble of {n_comps} {comp_source} "
+             f"comparison stars (flux-mean V={ensemble_vmag:.3f}); "
+             + (f"check star {kname}" if kname else "no check star"))
     if filt_note:
         notes += f"; {filt_note}"
     notes = notes.replace(",", ";")
@@ -1075,9 +1202,11 @@ def export_aavso(dat: Path, out: Path, name: str, *,
         for jd, mag, err in rows:
             am = _airmass_at(jd, airmass_map, airmass_tol) if airmass_map else None
             amass = f"{am:.3f}" if am is not None else "na"
+            kmag = kmags.get(round(jd, 6))
+            k_fields = [kname, f"{kmag:.3f}"] if kmag is not None else ["na", "na"]
             f.write(",".join([star_id, f"{jd:.6f}", f"{mag:.3f}", f"{err:.3f}",
-                              filt_code, "NO", "STD", "ENSEMBLE", "na", "na", "na",
-                              amass, "na", AAVSO_CHART, notes]) + "\n")
+                              filt_code, "NO", "STD", "ENSEMBLE", "na", *k_fields,
+                              amass, "na", chart_field, notes]) + "\n")
     return rows
 
 
@@ -1219,6 +1348,9 @@ def run_pipeline(config: dict,
       filt_note  (str)              extra note, e.g. "LP_filter_Seestar_S30Pro"
       obscode    (str)              AAVSO observer code; aavso.csv is only
                                     written when it is set
+      argos_selection (Optional[Path]) Argos photometry_selection.json: its
+                                    comparison and check stars replace the
+                                    automatic APASS ones when they fit the frame
       runner     (SirilRunner)
       phot_aperture  (float)        setphot forced-aperture radius px (def 10)
       phot_inner     (float)        sky-annulus inner radius px (def 20)
@@ -1244,6 +1376,7 @@ def run_pipeline(config: dict,
     filt_code  = config.get("filt_code", "CV")
     filt_note  = config.get("filt_note", "")
     obscode    = config.get("obscode", "")
+    argos_file = config.get("argos_selection")
     runner     = config["runner"]
 
     # ── Photometry (setphot) parameters — user-tunable ────────────────────────
@@ -1559,13 +1692,48 @@ def run_pipeline(config: dict,
     nina_comps: list[tuple[str, str, Optional[float]]] = []
     ref_vmags: list[Optional[float]] = []
 
+    def _in_frame(ra: float, dec: float, margin: int = 35) -> bool:
+        px, py = sky_to_pixel(ra, dec, ref_hdr)
+        if px is None:
+            return False
+        dx, dy = _to_disp(px, py)
+        return margin < dx < naxis1 - margin and margin < dy < naxis2 - margin
+
+    # ── ARGOS: the comparison and check stars chosen in Argos ─────────────────
+    # Argos picks them from the target's AAVSO VSP sequence. Used when they fit
+    # this frame; otherwise the automatic APASS paths below run as before.
+    argos_comps: list[tuple[str, float, float, float]] = []
+    argos_check: Optional[tuple[str, float, float]] = None
+    comp_source: str = AAVSO_CHART
+    chart: Optional[str] = AAVSO_CHART
+    if argos_file:
+        sel = load_argos_selection(argos_file)
+        try:
+            if sel is None:
+                raise ValueError("it cannot be read")
+            if not ref_hdr.get("CRVAL1"):
+                raise ValueError("the reference frame has no WCS")
+            argos_comps, argos_check, chart = argos_selection_stars(sel, star, _in_frame)
+        except ValueError as e:
+            on_log(f"[ARGOS] selection not used: {e} → automatic comparison stars")
+        else:
+            write_nina_csv(comp_csv, (star["name"], star["ra"], star["dec"], star["mag"]),
+                           argos_comps)
+            nina_comps = _parse_comp_csv(comp_csv)
+            lc_cmd = f"light_curve {registered} 0 -ninastars=comp_stars.csv"
+            comp_source = "AAVSO VSP"
+            on_log(f"[ARGOS] {len(argos_comps)} comparison stars"
+                   + (f" from VSP chart {chart}" if chart else " (VSP chart unknown)")
+                   + (f", check star {argos_check[0]}" if argos_check
+                      else ", no check star in the frame"))
+
     # ── PRIMARY: findcompstars → -ninastars ───────────────────────────────────
     # VSX names sometimes have a "V* " prefix that GCVS/SIMBAD doesn't use.
     ref_fits_name = (
         f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
         if ref_img_num is not None else None
     )
-    if ref_fits_name and (proc / ref_fits_name).exists():
+    if lc_cmd is None and ref_fits_name and (proc / ref_fits_name).exists():
         if comp_csv.exists():
             comp_csv.unlink()
         star_arg = star["name"].removeprefix("V* ").replace('"', '\\"')
@@ -1712,6 +1880,33 @@ def run_pipeline(config: dict,
     ], "_s5_phot.ssf")
     lc_output = list(runner.last_output)
 
+    # light_curve only reports its target: measure the Argos check star in a
+    # second run against the same comparison stars, keeping the target's
+    # light_curve.dat/.png where the steps below expect them.
+    check_output: list[str] = []
+    check_dat = proc / "light_curve_check.dat"
+    check_dat.unlink(missing_ok=True)
+    if argos_check is not None and (proc / "light_curve.dat").exists():
+        on_log(f"[ARGOS] measuring check star {argos_check[0]}")
+        for suffix in (".dat", ".png"):
+            p = proc / f"light_curve{suffix}"
+            if p.exists():
+                p.replace(proc / f"light_curve_target{suffix}")
+        write_nina_csv(proc / "check_stars.csv", (*argos_check, 0.0), argos_comps)
+        runner.run_script(proc, [
+            f'cd "{proc}"',
+            setphot_cmd,
+            f"light_curve {registered} 0 -ninastars=check_stars.csv",
+        ], "_s5b_check.ssf")
+        check_output = list(runner.last_output)
+        for suffix in (".dat", ".png"):
+            p = proc / f"light_curve{suffix}"
+            if p.exists():
+                p.replace(proc / f"light_curve_check{suffix}")
+            kept = proc / f"light_curve_target{suffix}"
+            if kept.exists():
+                kept.replace(p)
+
     for fit_path, (offset, val) in bayer_stripped.items():
         _fits_restore_keyword(fit_path, "BAYERPAT", offset, val)
     if bayer_stripped:
@@ -1785,6 +1980,29 @@ def run_pipeline(config: dict,
             on_log(f"Ensemble: {n_used} comparison stars, flux-mean catalogue "
                    f"V = {ensemble_vmag:.3f}")
 
+        # KNAME/KMAG: the check star's magnitude on the same frames. It shares
+        # the target's zero point only if Siril averaged the same comparison
+        # stars in both runs (a comp too close to the check star is skipped).
+        check: Optional[tuple[str, dict[float, float]]] = None
+        out_check = results_dir / "check_light_curve.dat"
+        out_check.unlink(missing_ok=True)
+        if argos_check is not None and ensemble_vmag is not None:
+            kname = argos_check[0]
+            if not check_dat.exists():
+                on_log(f"Check star {kname}: not measured — KNAME/KMAG left as na")
+            elif (siril_refs_used(check_output) != n_used
+                  or siril_loaded_comps(check_output, nina_comps)
+                  != siril_loaded_comps(lc_output, nina_comps)):
+                on_log(f"Check star {kname}: Siril used other comparison stars for "
+                       "it — KNAME/KMAG left as na")
+            else:
+                inject_jd_into_dat(check_dat, seq_file, stem, seq_fixlen, proc, exptime_s)
+                kmags = {round(jd, 6): vc + ensemble_vmag
+                         for jd, vc, _ in _read_lc_dat(check_dat) if math.isfinite(vc)}
+                check = (kname, kmags)
+                shutil.copy2(check_dat, out_check)
+                on_log(f"Check star {kname}: {len(kmags)} points → KNAME/KMAG")
+
         # AAVSO extended format (ensemble photometry, apparent magnitudes)
         # Airmass per point comes from the registered frame headers (AIRMASS keyword)
         airmass_map = build_airmass_map(proc, stem, seq_fixlen)
@@ -1800,7 +2018,8 @@ def run_pipeline(config: dict,
                                 obscode=obscode, ensemble_vmag=ensemble_vmag,
                                 n_comps=n_used or 0,
                                 filt_code=filt_code, filt_note=filt_note,
-                                airmass_map=airmass_map)
+                                airmass_map=airmass_map,
+                                comp_source=comp_source, chart=chart, check=check)
         except ValueError as e:
             on_log(f"AAVSO CSV not written: {e}")
         else:

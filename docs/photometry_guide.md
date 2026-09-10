@@ -34,7 +34,7 @@ Default magnitude limit: **14**. All VSX variable stars within the cone and belo
 
 ### 3. Target and comparison star selection
 
-After selecting a target from the table, the script calls `findcompstars` (Siril) or queries VizieR APASS DR9 depending on availability. See [photometry path selection](#photometry-path-selection) for details.
+After selecting a target from the table, the script uses the comparison and check stars chosen in Argos when the session has an Argos selection, and otherwise calls `findcompstars` (Siril) or queries VizieR APASS DR9 depending on availability. See [photometry path selection](#photometry-path-selection) for details.
 
 ### 4. Filter and calibration frames
 
@@ -128,6 +128,14 @@ JD,FWHM_x_arcsec,FWHM_y_arcsec
 
 ## Photometry path selection
 
+**ARGOS** — the stars chosen in Argos + `-ninastars`
+
+Argos writes the comparison and check stars it used during acquisition, taken from the target's AAVSO VSP sequence, to `photometry_selection.json` in its session folder. The script fills the **Argos:** field with that file when it loads the session; browse to another one, or clear the field to use the automatic paths below.
+
+The comparison stars go to Siril as `Comp2` (AAVSO) rows of `comp_stars.csv`, named by AUID. Only those inside the reference frame and with a catalogue V magnitude are kept. The check star is measured in a second `light_curve` run against the same comparison stars, since `light_curve` only reports its target; `aavso.csv` gets its magnitude in `KMAG` only if Siril used the same comparison stars in both runs.
+
+The selection is not used — and the log says why — when its target is more than 30″ from the selected star, when fewer than two comparison stars remain, or when the reference frame has no WCS. The script then falls back to PRIMARY.
+
 **PRIMARY** — `findcompstars` + `-ninastars`
 
 Siril handles the sky-to-pixel coordinate conversion internally via the WCS headers. Requires valid WCS on all frames and at least 3 comp stars in the field.
@@ -177,10 +185,10 @@ ES UMa,2461161.334643,11.707,0.021,CV,NO,STD,ENSEMBLE,na,na,na,1.302,na,APASS DR
 | MAG / MERR | V_app / error, 3 decimals | NaN and MERR > 0.5 excluded |
 | TRANS / MTYPE | `NO` / `STD` | untransformed, standardised on the comp stars' catalogue magnitudes |
 | CNAME / CMAG | `ENSEMBLE` / `na` | the spec's ensemble convention |
-| KNAME / KMAG | `na` | no check star (the spec recommends one for ensemble photometry) |
+| KNAME / KMAG | Argos check star AUID / its magnitude, else `na` | the spec recommends a check star for ensemble photometry; the automatic paths have none |
 | GROUP | `na` | time series, single filter |
-| CHART | `APASS DR9` | comp stars are not from an AAVSO VSP sequence, so the catalogue is named |
-| NOTES | comp count, `C_cat`, filter note | the spec asks for information on self-chosen comp stars |
+| CHART | VSP chart ID (Argos stars), else `APASS DR9` | a VSP sequence is reported by its chart ID; self-chosen comp stars by their catalogue |
+| NOTES | comp source and count, `C_cat`, check star, filter note | the spec asks for information on self-chosen comp stars |
 
 `tests/aavso_spec.py` checks exported files against the rules of the spec, and is itself checked against the spec's example files.
 

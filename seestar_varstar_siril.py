@@ -41,6 +41,8 @@ from pipeline import (  # noqa: E402
     query_vsx,
     run_pipeline,
     resolve_frame_dir,
+    ARGOS_SELECTION_FILE,
+    load_argos_selection,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,6 +308,25 @@ class App(tk.Tk):
         tk.Label(nstars_row, text="(3–19, Siril max=19)", bg=BG, fg=FG2,
                  font=("Helvetica", 10)).pack(side="left")
 
+        # Comparison + check stars chosen in Argos (photometry_selection.json);
+        # left empty, the pipeline picks APASS comparison stars itself.
+        argos_row = self._row(obs_card)
+        argos_row.pack(fill="x", pady=(4, 0))
+        tk.Label(argos_row, text="Argos:", bg=BG, fg=FG2,
+                 font=("Helvetica", 11), width=9, anchor="w").pack(side="left")
+        self.argos_var = tk.StringVar()
+        tk.Entry(argos_row, textvariable=self.argos_var, bg=BG2, fg=FG,
+                 insertbackground=FG, font=("Helvetica", 10), width=22,
+                 relief="flat", highlightthickness=1,
+                 highlightbackground=BORDER,
+                 highlightcolor=BLUE).pack(side="left", padx=(0, 4))
+        self._button(argos_row, "Browse…", self._browse_argos).pack(side="left")
+        self.lbl_argos = tk.Label(obs_card, bg=BG, fg=FG2, font=("Helvetica", 10),
+                                  anchor="w", justify="left")
+        self.lbl_argos.pack(fill="x")
+        self.argos_var.trace_add("write", lambda *_: self._describe_argos())
+        self._describe_argos()
+
         phot_card = tk.LabelFrame(right, text=" Photometry (setphot) ",
                                   bg=BG, fg=BLUE, font=("Helvetica", 11, "bold"),
                                   relief="solid", bd=1, padx=8, pady=6)
@@ -452,6 +473,32 @@ class App(tk.Tk):
         if d:
             var.set(d)
 
+    def _browse_argos(self):
+        f = filedialog.askopenfilename(
+            title="Select the Argos photometry_selection.json",
+            initialdir=str(self.session_dir or Path.home()),
+            filetypes=[("Argos selection", ARGOS_SELECTION_FILE), ("JSON", "*.json")])
+        if f:
+            self.argos_var.set(f)
+
+    def _describe_argos(self):
+        """Say which comparison stars the run will use."""
+        path = self.argos_var.get().strip()
+        if not path:
+            text = "none — APASS comparison stars chosen automatically"
+        else:
+            sel = load_argos_selection(Path(path))
+            if sel is None:
+                text = "cannot read this file — APASS comparison stars will be used"
+            else:
+                n_comp = len(sel.get("comparison_stars") or [])
+                n_check = len(sel.get("check_stars") or [])
+                charts = {c.get("catalogue_chart_id")
+                          for c in sel.get("comparison_stars") or []} - {None}
+                text = (f"{n_comp} comparison + {n_check} check star(s) chosen in Argos"
+                        + (f", VSP chart {charts.pop()}" if len(charts) == 1 else ""))
+        self.lbl_argos.configure(text=f"Comparison stars: {text}")
+
     # ── Init ──────────────────────────────────────────────────────────────────
 
     def _init_bg(self):
@@ -516,6 +563,13 @@ class App(tk.Tk):
 
     def _load_session_bg(self):
         session = self.session_dir
+
+        # An Argos session hands off the stars chosen during acquisition.
+        selection = session / ARGOS_SELECTION_FILE
+        found = str(selection) if selection.is_file() else ""
+        self.after(0, lambda: self.argos_var.set(found))
+        if found:
+            self._log(f"Argos selection found: {selection.name}")
 
         # Auto-fill calibration fields from the session's own calib folders
         # (Argos: Darks/<sub>/, Flats/<sub>/, Biases/<sub>/) unless already set.
@@ -806,6 +860,8 @@ class App(tk.Tk):
             "filt_code":  filt_code,
             "filt_note":  filt_note,
             "obscode":    self.obscode_var.get().strip().upper(),
+            "argos_selection": (Path(self.argos_var.get().strip())
+                                if self.argos_var.get().strip() else None),
             "runner":     self.runner,
             "phot_aperture":  self.ap_var.get(),
             "phot_inner":     self.inner_var.get(),
