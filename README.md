@@ -21,7 +21,7 @@ Seestar FITS frames
     ↓
   Siril: calibrate → register → plate-solve → aperture photometry
     ↓
-  photometry.csv  ·  fwhm.csv  ·  StarName_aavso.csv
+  photometry.csv  ·  fwhm.csv  ·  aavso.csv
     ↓
   varstar_postprod/plot_lightcurve.py  ·  analysis.ipynb
 

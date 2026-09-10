@@ -270,6 +270,18 @@ class App(tk.Tk):
                      state="readonly", width=30,
                      style="Dark.TCombobox").pack(side="left", padx=(0, 4))
 
+        code_row = self._row(obs_card)
+        code_row.pack(fill="x", pady=(0, 4))
+        tk.Label(code_row, text="Obscode:", bg=BG, fg=FG2,
+                 font=("Helvetica", 11), width=9, anchor="w").pack(side="left")
+        self.obscode_var = tk.StringVar()
+        tk.Entry(code_row, textvariable=self.obscode_var, bg=BG2, fg=FG,
+                 insertbackground=FG, font=("Helvetica", 11), relief="flat",
+                 highlightthickness=1, highlightbackground=BORDER,
+                 highlightcolor=BLUE, width=8).pack(side="left", padx=(0, 8))
+        tk.Label(code_row, text="(AAVSO observer code — needed for aavso.csv)",
+                 bg=BG, fg=FG2, font=("Helvetica", 10)).pack(side="left")
+
         step_row = self._row(obs_card)
         step_row.pack(fill="x")
         tk.Label(step_row, text="Start from:", bg=BG, fg=FG2,
@@ -798,6 +810,7 @@ class App(tk.Tk):
             "bias_dir":   Path(self.bias_var.get()) if self.bias_var.get().strip() else None,
             "filt_code":  filt_code,
             "filt_note":  filt_note,
+            "obscode":    self.obscode_var.get().strip().upper(),
             "runner":     self.runner,
             "phot_aperture":  self.ap_var.get(),
             "phot_inner":     self.inner_var.get(),
@@ -838,9 +851,11 @@ class App(tk.Tk):
         if ok:
             self.lbl_prog.configure(text="Done!", fg=GREEN)
             self._log(f"✓  {msg}")
+            aavso = ("aavso.csv" if (Path(msg) / "aavso.csv").exists()
+                     else "no aavso.csv (see log)")
             messagebox.showinfo("Done!",
                                 f"Results saved in:\n{msg}\n\n"
-                                "Files: light_curve.dat  ·  aavso.csv\n"
+                                f"Files: light_curve.dat  ·  {aavso}\n"
                                 "       photometry.csv  ·  light_curve.png\n"
                                 "       pipeline.log")
         else:

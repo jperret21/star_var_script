@@ -6,6 +6,7 @@
 
 | Version | Changes |
 |---------|---------|
+| v0.1.6 | AAVSO export accepted by WebObs (commented column line, `STD` apparent magnitudes, observer code); V_app from the flux mean of the comp stars Siril used |
 | v0.1.5 | PRIMARY path via `findcompstars` + `-ninastars`; ensemble V_app; FWHM from `.seq` |
 | v0.1.4 | Frame border safety margin raised to 200 px |
 | v0.1.3 | In-frame filtering of comp stars for FALLBACK A/B |
@@ -15,7 +16,7 @@
 
 ---
 
-## v0.1.5 — How it works
+## v0.1.6 — How it works
 
 ### 1. Session path
 
@@ -38,6 +39,8 @@ After selecting a target from the table, the script calls `findcompstars` (Siril
 ### 4. Filter and calibration frames
 
 **Filter:** choice between LP (Seestar default) or no filter. Only affects the `FILT` field in the AAVSO export (`CV` in both cases — neither matches a standard photometric band).
+
+**Obscode:** your AAVSO observer code. Without it no `aavso.csv` is written (see [AAVSO export](#aavso-export)).
 
 **Calibration:** the user can provide folders of darks, flats, and/or bias frames. If at least one type is given, the pipeline creates masters automatically at step 0:
 
@@ -93,7 +96,7 @@ light_curve r_light_ 0 -ninastars=comp_stars.csv
 
 After Siril exits, the Python pipeline:
 1. Reads `light_curve.dat`
-2. Computes `V_app = V_C + median(V_catalog_comp)` from `comp_stars.csv`
+2. Computes `V_app = V_C + C_cat`, `C_cat` being the flux mean of the catalogue V magnitudes of the comp stars Siril used (see [V_app](#v_app-and-the-lp-filter-bias))
 3. Extracts per-frame FWHM from `r_light_.seq` (R0 lines), aligns with `DATE-OBS` from FITS headers, converts to arcsec
 4. Writes result files
 
@@ -103,12 +106,12 @@ After Siril exits, the Python pipeline:
 results/StarName/
 ├── photometry.csv       JD, V_C, V_app, err
 ├── fwhm.csv             JD, FWHM_x_arcsec, FWHM_y_arcsec
-└── StarName_aavso.csv   AAVSO Extended Format
+└── aavso.csv            AAVSO Extended Format (only when it can be submitted)
 ```
 
 `photometry.csv`:
 ```
-# Ensemble V (APASS comp stars median): 12.284
+# Ensemble V (flux mean of the APASS comp stars): 12.284
 # V_app = V_C + ensemble_V
 JD,V_C,V_app,err
 2461161.334643,1.2421,13.5261,0.0868
@@ -141,9 +144,45 @@ Last resort. Differential magnitude is noisier, and any intrinsic variability of
 
 ## V_app and the LP filter bias
 
-`V_app = V_C + median(V_catalog)`
+`V_app = V_C + C_cat`, with `C_cat = -2.5 log10(mean(10^(-0.4 V_i)))` over the catalogue V magnitudes of the comp stars.
 
-V_C is unaffected by the LP filter (target and comp stars go through the same filter). The bias enters via `median(V_catalog)`, which is in standard APASS V while the observation is in LP. For a cataclysmic variable (blue + red) vs. G/K comp stars, expect ±0.2–0.5 mag absolute offset. Relative variations within a session are reliable.
+Siril's `light_curve` computes `V_C` against the mean *flux* of the comp stars (`photometry.c`, `new_light_curve`), so the catalogue magnitudes must be averaged the same way. A median of the V magnitudes is biased when the comp stars span a few magnitudes — about 0.6 mag for comps between V=10.2 and 13.1, the brightest dominating the flux mean (earlier versions had this bias).
+
+`C_cat` must cover exactly the stars Siril averaged. Siril skips `-ninastars` stars on the frame border (logged by name) and drops any comp star measured on fewer than 4/5 of the frames (only the count is logged). The pipeline reads both from Siril's output; when a star was dropped it cannot tell which, so V_app — and `aavso.csv` — are left out, and the log says so. Siril's output is forced to English for this (`LANGUAGE=C`); a language chosen in Siril's own preferences overrides that, and only English and French messages are recognised.
+
+V_C is unaffected by the LP filter (target and comp stars go through the same filter). The bias enters via `C_cat`, which is in standard APASS V while the observation is in LP. For a cataclysmic variable (blue + red) vs. G/K comp stars, expect ±0.2–0.5 mag absolute offset. Relative variations within a session are reliable.
+
+---
+
+## AAVSO export
+
+`aavso.csv` follows the [AAVSO Extended File Format](https://www.aavso.org/aavso-extended-file-format), to upload on WebObs. It is written only when it can be submitted as is: an observer code is set, V_app is available (AAVSO cannot use the differential V_C) and the star name fits the format. Otherwise the log says why and any previous `aavso.csv` is removed.
+
+```
+#TYPE=EXTENDED
+#OBSCODE=ABC
+#SOFTWARE=Siril+seestar_varstar_siril.py v0.1.6
+#DELIM=,
+#DATE=JD
+#OBSTYPE=CCD
+#NAME,DATE,MAG,MERR,FILT,TRANS,MTYPE,CNAME,CMAG,KNAME,KMAG,AMASS,GROUP,CHART,NOTES
+ES UMa,2461161.334643,11.707,0.021,CV,NO,STD,ENSEMBLE,na,na,na,1.302,na,APASS DR9,Seestar S30 Pro; Siril ensemble of 3 APASS DR9 comparison stars (flux-mean V=12.119); no check star; LP_filter_Seestar_S30Pro
+```
+
+| Field | Value | Why |
+|-------|-------|-----|
+| column-name line | starts with `#` | WebObs reads every other line as an observation |
+| NAME | VSX name without `V* ` | AAVSO star identifier, max 30 characters |
+| DATE | JD UTC, mid-exposure | Siril adds half the exposure time |
+| MAG / MERR | V_app / error, 3 decimals | NaN and MERR > 0.5 excluded |
+| TRANS / MTYPE | `NO` / `STD` | untransformed, standardised on the comp stars' catalogue magnitudes |
+| CNAME / CMAG | `ENSEMBLE` / `na` | the spec's ensemble convention |
+| KNAME / KMAG | `na` | no check star (the spec recommends one for ensemble photometry) |
+| GROUP | `na` | time series, single filter |
+| CHART | `APASS DR9` | comp stars are not from an AAVSO VSP sequence, so the catalogue is named |
+| NOTES | comp count, `C_cat`, filter note | the spec asks for information on self-chosen comp stars |
+
+`tests/aavso_spec.py` checks exported files against the rules of the spec, and is itself checked against the spec's example files.
 
 `seqsetmag` (Siril's magnitude calibration) is not scriptable in headless mode — V_app is therefore computed externally.
 

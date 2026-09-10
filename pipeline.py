@@ -12,13 +12,14 @@ import datetime
 import math
 import os
 import platform
+import re
 import shutil
 import statistics
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 # ── optional runtime deps ────────────────────────────────────────────────────
 
@@ -63,11 +64,25 @@ FILTER_OPTIONS: dict[str, tuple[str, str]] = {
     "LP anti-pollution filter (CV)":  ("CV",  "LP_filter_Seestar_S30Pro"),
     "V Johnson":                       ("V",   ""),
     "B Johnson":                       ("B",   ""),
-    "R Johnson":                       ("R",   ""),
-    "I Johnson":                       ("I",   ""),
-    "Sloan r'":                        ("SRJ", ""),
-    "Sloan i'":                        ("SIJ", ""),
+    "R Cousins (Rc)":                  ("R",   ""),
+    "I Cousins (Ic)":                  ("I",   ""),
+    "Sloan r'":                        ("SR",  ""),
+    "Sloan i'":                        ("SI",  ""),
 }
+
+# FILT codes of the AAVSO Extended File Format
+# (https://www.aavso.org/aavso-extended-file-format). "O" is left out: the spec
+# says WebObs currently rejects it.
+AAVSO_FILTERS = frozenset({
+    "U", "B", "V", "R", "I", "J", "H", "K", "TG", "TB", "TR", "CV", "CR",
+    "SZ", "SU", "SG", "SR", "SI", "STU", "STV", "STB", "STY", "STHBW", "STHBN",
+    "MA", "MB", "MI", "ZS", "Y", "HA", "HAC",
+})
+
+# Comparison stars come from APASS DR9 (VizieR II/336, for both Siril's
+# findcompstars and query_apass), not from an AAVSO VSP sequence. For such
+# stars the spec asks for the catalogue name in CHART instead of a chart ID.
+AAVSO_CHART = "APASS DR9"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,6 +439,8 @@ class SirilRunner:
     def __init__(self, log_cb: Callable[[str], None] | None = None):
         self._log = log_cb or print
         self._iface = None
+        #: stdout lines of the last run_script call (read back by step 5)
+        self.last_output: list[str] = []
         if HAS_SIRILPY:
             try:
                 self._iface = SirilInterface()
@@ -434,6 +451,7 @@ class SirilRunner:
 
     def run_script(self, working_dir: Path, commands: list[str],
                    name: str = "_phot.ssf") -> bool:
+        self.last_output = []
         script = working_dir / name
         script.write_text("requires 1.4\n" + "\n".join(commands) + "\n",
                           encoding="utf-8")
@@ -442,12 +460,17 @@ class SirilRunner:
             self._log("ERROR: siril-cli not found. Install Siril 1.4+")
             return False
         self._log(f"→ {cli} -d {working_dir.name} -s {name}")
+        # LANGUAGE=C keeps Siril's messages untranslated so step 5 can parse
+        # them (Siril's own language preference still overrides it).
         proc = subprocess.Popen(
             [cli, "-d", str(working_dir), "-s", str(script)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            env={**os.environ, "LANGUAGE": "C"},
         )
         for line in proc.stdout:
-            self._log(line.rstrip())
+            line = line.rstrip()
+            self.last_output.append(line)
+            self._log(line)
         proc.wait()
         return proc.returncode == 0
 
@@ -481,13 +504,14 @@ def truncate_comp_csv(csv_path: Path, n: int) -> int:
         return 0
 
 
-def _parse_comp_csv_vmag(path: Path) -> Optional[float]:
-    """Return median V mag of comparison stars from a Siril findcompstars CSV.
+def _parse_comp_csv(path: Path) -> list[tuple[str, str, Optional[float]]]:
+    """Comparison stars of a Siril findcompstars CSV, as (type, name, V) tuples.
 
     Format: comment lines (#), then 'type,name,ra,dec,mag' header, then data rows
     where rows starting with 'Comp' have catalog V magnitudes in column 5 (index 4).
+    V is None when a row has no usable magnitude.
     """
-    vmags: list[float] = []
+    comps: list[tuple[str, str, Optional[float]]] = []
     try:
         with open(path, newline="", encoding="utf-8") as f:
             for line in f:
@@ -495,14 +519,72 @@ def _parse_comp_csv_vmag(path: Path) -> Optional[float]:
                 if not line or line.startswith("#"):
                     continue
                 parts = line.split(",")
-                if len(parts) >= 5 and parts[0].startswith("Comp"):
+                if len(parts) >= 2 and parts[0].startswith("Comp"):
                     try:
-                        vmags.append(float(parts[4]))
-                    except ValueError:
-                        pass
+                        vmag: Optional[float] = float(parts[4])
+                    except (ValueError, IndexError):
+                        vmag = None
+                    comps.append((parts[0], parts[1], vmag))
     except Exception:
+        return []
+    return comps
+
+
+def ensemble_zero_point(vmags: list[float]) -> Optional[float]:
+    """Catalogue V magnitude of the comparison ensemble, averaged as Siril does.
+
+    Siril's light_curve divides by the mean *flux* of the comparison stars:
+    C = -2.5 log10(mean(10^(-0.4 m_i))) (photometry.c, new_light_curve). The same
+    average of the catalogue magnitudes turns V-C into an apparent magnitude,
+    V = (V-C) + C_cat. A median of the V magnitudes is biased — by several
+    tenths of a magnitude when the comparison stars span a few magnitudes, since
+    the brightest dominate the flux mean.
+    """
+    if not vmags:
         return None
-    return statistics.median(vmags) if vmags else None
+    return -2.5 * math.log10(sum(10 ** (-0.4 * v) for v in vmags) / len(vmags))
+
+
+# Siril light_curve log lines (photometry.c), in English and French. Other
+# languages are not recognised, which leaves the apparent magnitude unavailable.
+_SIRIL_REFS_USED = re.compile(
+    r"Using (\d+) stars to calibrate the light curve"
+    r"|Utilisation de (\d+) étoiles pour étalonner la courbe de lumière")
+_SIRIL_ONE_REF = ("Only one reference star was validated",
+                  "Une seule étoile de référence a été validée")
+
+
+def siril_refs_used(output: list[str]) -> Optional[int]:
+    """Number of comparison stars light_curve averaged, read from its log.
+
+    Siril drops a comparison star measured on fewer than 4/5 of the frames and
+    does not say which one. Returns None when the log line is not found.
+    """
+    for line in output:
+        m = _SIRIL_REFS_USED.search(line)
+        if m:
+            return int(m.group(1) or m.group(2))
+        if any(s in line for s in _SIRIL_ONE_REF):
+            return 1
+    return None
+
+
+def siril_loaded_comps(output: list[str],
+                       comps: list[tuple[str, str, Optional[float]]]
+                       ) -> list[tuple[str, str, Optional[float]]]:
+    """The -ninastars comparison stars Siril accepted, read from its log.
+
+    Siril logs "star <name> [<type>] added as a reference star" for each star it
+    keeps ("<name> [<type>]" survives translation) and skips, with another
+    message, those on the border or too close to another star.
+    """
+    loaded = []
+    for comp in comps:
+        ctype, name, _ = comp
+        added = re.compile(rf"(?:^|\s){re.escape(name)} \[{re.escape(ctype)}\]")
+        if any(added.search(line) for line in output):
+            loaded.append(comp)
+    return loaded
 
 
 def export_fwhm_csv(seq_path: Path, proc: Path, stem: str,
@@ -926,17 +1008,45 @@ def apply_error_floor(dat: Path,
             "sigma_syst": sigma_syst, "n": len(good)}
 
 
-def export_aavso(dat: Path, out: Path, name: str,
+_AAVSO_FIELDS = ("NAME", "DATE", "MAG", "MERR", "FILT", "TRANS", "MTYPE", "CNAME",
+                 "CMAG", "KNAME", "KMAG", "AMASS", "GROUP", "CHART", "NOTES")
+
+
+def export_aavso(dat: Path, out: Path, name: str, *,
+                 obscode: str, ensemble_vmag: Optional[float], n_comps: int,
                  filt_code: str = "CV", filt_note: str = "",
                  merr_max: float = 0.5,
                  airmass_map: Optional[list[tuple[float, float]]] = None) -> list:
     """Export light curve to AAVSO Extended format.
 
+    Spec: https://www.aavso.org/aavso-extended-file-format. Rows are ensemble
+    photometry: MAG = (V-C) + ensemble_vmag, MTYPE=STD, CNAME=ENSEMBLE, CMAG=na,
+    TRANS=NO. The column-name line starts with '#': WebObs reads every other
+    line as an observation.
+
+    Raises ValueError, without writing *out*, when the file could not be
+    submitted: no observer code, no ensemble magnitude (MAG would be the
+    differential V-C), or a filter code or star name the format rejects.
     Filters NaN magnitudes and MERR > merr_max.
     When *airmass_map* (a sorted list of (JD, airmass) from build_airmass_map) is
     provided, the AMASS column is filled by nearest-JD match; otherwise it is "na".
-    Returns list of (jd, mag, err) rows written.
+    Returns list of (jd, mag, err) rows written, mag being the apparent magnitude.
     """
+    obscode = obscode.strip().upper()
+    if not obscode:
+        raise ValueError("no AAVSO observer code set")
+    if re.search(r"[\s,#|]", obscode):
+        raise ValueError(f"invalid AAVSO observer code {obscode!r}")
+    if ensemble_vmag is None:
+        raise ValueError("apparent magnitude unavailable — the magnitudes would "
+                         "be differential (V-C), which AAVSO cannot use")
+    if filt_code not in AAVSO_FILTERS:
+        raise ValueError(f"{filt_code!r} is not an AAVSO filter code")
+    star_id = name.removeprefix("V* ").strip()
+    if not star_id or len(star_id) > 30 or "," in star_id or not star_id.isascii():
+        raise ValueError(f"{star_id!r} is not a valid AAVSO star name "
+                         "(ASCII, at most 30 characters, no comma)")
+
     rows = []
     with open(dat) as f:
         for line in f:
@@ -947,13 +1057,13 @@ def export_aavso(dat: Path, out: Path, name: str,
             try:
                 jd_i = next(i for i, p in enumerate(parts) if float(p) > 2_400_000)
                 jd   = float(parts[jd_i])
-                mag  = float(parts[jd_i + 1])
+                vc   = float(parts[jd_i + 1])
                 err  = float(parts[jd_i + 2]) if len(parts) > jd_i + 2 else 0.0
-                if math.isnan(mag) or math.isnan(err):
+                if not (math.isfinite(vc) and math.isfinite(err)):
                     continue
                 if err > merr_max:
                     continue
-                rows.append((jd, mag, err))
+                rows.append((jd, vc + ensemble_vmag, err))
             except (ValueError, StopIteration, IndexError):
                 continue
     if not rows:
@@ -967,23 +1077,28 @@ def export_aavso(dat: Path, out: Path, name: str,
                     for i in range(len(airmass_map) - 1)]
         airmass_tol = statistics.median(spacings) / 2.0
 
-    notes = f"seestar_s30pro|{filt_note}" if filt_note else "seestar_s30pro"
-    with open(out, "w", newline="") as f:
-        # Write header directly — csv.writer would quote "#DELIM=," (contains comma)
-        for line in ["#TYPE=EXTENDED", "#OBSCODE=XXXX",
+    # The spec asks for information on self-chosen comparison stars in NOTES.
+    # No field may contain the delimiter.
+    notes = (f"Seestar S30 Pro; Siril ensemble of {n_comps} {AAVSO_CHART} "
+             f"comparison stars (flux-mean V={ensemble_vmag:.3f}); no check star")
+    if filt_note:
+        notes += f"; {filt_note}"
+    notes = notes.replace(",", ";")
+
+    # Written by hand, not with csv.writer: it would quote "#DELIM=," and end
+    # lines with \r\n.
+    with open(out, "w", encoding="utf-8") as f:
+        for line in ["#TYPE=EXTENDED", f"#OBSCODE={obscode}",
                      f"#SOFTWARE=Siril+seestar_varstar_siril.py v{VERSION}",
-                     f"#FILTER={filt_code}",
-                     "#DELIM=,", "#DATE=JD", "#OBSTYPE=CCD"]:
+                     "#DELIM=,", "#DATE=JD", "#OBSTYPE=CCD",
+                     "#" + ",".join(_AAVSO_FIELDS)]:
             f.write(line + "\n")
-        w = csv.writer(f)
-        w.writerow(["NAME","DATE","MAG","MERR","FILT","TRANS","MTYPE",
-                    "CNAME","CMAG","KNAME","KMAG","AMASS","GROUP","CHART","NOTES"])
         for jd, mag, err in rows:
             am = _airmass_at(jd, airmass_map, airmass_tol) if airmass_map else None
-            amass = f"{am:.4f}" if am is not None else "na"
-            w.writerow([name, f"{jd:.6f}", f"{mag:.4f}", f"{err:.4f}",
-                        filt_code, "NO", "DIFF",
-                        "ENSEMBLE", "na", "na", "na", amass, "1", "na", notes])
+            amass = f"{am:.3f}" if am is not None else "na"
+            f.write(",".join([star_id, f"{jd:.6f}", f"{mag:.3f}", f"{err:.3f}",
+                              filt_code, "NO", "STD", "ENSEMBLE", "na", "na", "na",
+                              amass, "na", AAVSO_CHART, notes]) + "\n")
     return rows
 
 
@@ -999,7 +1114,7 @@ def export_photometry_csv(dat: Path, out: Path, star_name: str,
     with open(dat) as f_in, open(out, "w", newline="", encoding="utf-8") as f_out:
         f_out.write(f"# Star: {star_name}\n")
         if ensemble_vmag is not None:
-            f_out.write(f"# Ensemble V (APASS comp stars median): {ensemble_vmag:.3f}\n")
+            f_out.write(f"# Ensemble V (flux mean of the APASS comp stars): {ensemble_vmag:.3f}\n")
             f_out.write("# V_app = V_C + ensemble_V  (approximate apparent V magnitude)\n")
         w = csv.writer(f_out)
         if ensemble_vmag is not None:
@@ -1124,6 +1239,8 @@ def run_pipeline(config: dict,
       bias_dir   (Optional[Path])
       filt_code  (str)              AAVSO filter code, e.g. "CV"
       filt_note  (str)              extra note, e.g. "LP_filter_Seestar_S30Pro"
+      obscode    (str)              AAVSO observer code; aavso.csv is only
+                                    written when it is set
       runner     (SirilRunner)
       phot_aperture  (float)        setphot forced-aperture radius px (def 10)
       phot_inner     (float)        sky-annulus inner radius px (def 20)
@@ -1148,6 +1265,7 @@ def run_pipeline(config: dict,
     start_step = config.get("start_step", 1)
     filt_code  = config.get("filt_code", "CV")
     filt_note  = config.get("filt_note", "")
+    obscode    = config.get("obscode", "")
     runner     = config["runner"]
 
     # ── Photometry (setphot) parameters — user-tunable ────────────────────────
@@ -1456,7 +1574,12 @@ def run_pipeline(config: dict,
         else:
             on_log("Frame WCS not available — skipping bounds check")
 
-    ensemble_vmag: Optional[float] = None   # comp-star median V; enables apparent mag
+    # Comparison stars handed to light_curve, for the apparent magnitude.
+    # PRIMARY: rows of comp_stars.csv, matched afterwards against Siril's log
+    # (it skips border stars). FALLBACK A/B: every -refat/-refwcs star — Siril
+    # aborts rather than skip one.
+    nina_comps: list[tuple[str, str, Optional[float]]] = []
+    ref_vmags: list[Optional[float]] = []
 
     # ── PRIMARY: findcompstars → -ninastars ───────────────────────────────────
     # VSX names sometimes have a "V* " prefix that GCVS/SIMBAD doesn't use.
@@ -1476,10 +1599,7 @@ def run_pipeline(config: dict,
         ], "_s5a_findcomp.ssf")
         if comp_csv.exists() and comp_csv.stat().st_size > 50:
             kept = truncate_comp_csv(comp_csv, max(3, min(50, nstars)))
-            ensemble_vmag = _parse_comp_csv_vmag(comp_csv)
-            if ensemble_vmag is not None:
-                on_log(f"[PRIMARY] ensemble comp V = {ensemble_vmag:.2f} "
-                       f"(median of {kept} APASS stars from comp_stars.csv)")
+            nina_comps = _parse_comp_csv(comp_csv)
             lc_cmd = f"light_curve {registered} 0 -ninastars=comp_stars.csv"
             on_log(f"[PRIMARY] OK — {kept} comp stars via findcompstars")
         else:
@@ -1530,11 +1650,7 @@ def run_pipeline(config: dict,
             else:
                 on_log("[FALLBACK A] no comp stars in frame (tried target + field centre)")
         if ref_pix:
-            _vmags = [cs["vmag"] for cs in _ens_comps if cs.get("vmag", 0) > 0]
-            if _vmags:
-                ensemble_vmag = statistics.median(_vmags)
-                on_log(f"[FALLBACK A] ensemble comp V = {ensemble_vmag:.2f} "
-                       f"(median of {len(_vmags)} APASS stars)")
+            ref_vmags = [cs.get("vmag") for cs in _ens_comps]
             lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
             for rdx, rdy in ref_pix:
                 lc_cmd += f" -refat={rdx},{rdy}"
@@ -1572,9 +1688,7 @@ def run_pipeline(config: dict,
                     "The target may be at the edge of the field with no suitable "
                     "APASS reference stars in the image. Try a different star.")
             return
-        _vmags = [cs["vmag"] for cs in inframe_comps if cs.get("vmag", 0) > 0]
-        if _vmags:
-            ensemble_vmag = statistics.median(_vmags)
+        ref_vmags = [cs.get("vmag") for cs in inframe_comps]
         on_log("[FALLBACK B] using sky coordinates (-wcs/-refwcs)")
         lc_cmd = (f"light_curve {registered} 0 "
                   f"-wcs={star['ra']:.6f},{star['dec']:.6f}")
@@ -1618,6 +1732,7 @@ def run_pipeline(config: dict,
         setphot_cmd,
         lc_cmd,
     ], "_s5_phot.ssf")
+    lc_output = list(runner.last_output)
 
     for fit_path, (offset, val) in bayer_stripped.items():
         _fits_restore_keyword(fit_path, "BAYERPAT", offset, val)
@@ -1669,28 +1784,59 @@ def run_pipeline(config: dict,
             else:
                 on_log("Error floor: too few points to measure scatter — MERR unchanged")
 
-        # AAVSO extended format (differential V-C, ENSEMBLE comp)
+        # Apparent magnitude V = (V-C) + C_cat needs the exact set of comparison
+        # stars Siril averaged. Siril drops a star measured on < 4/5 of the frames
+        # without naming it, so C_cat is only known when none was dropped.
+        loaded_vmags = ([v for _, _, v in siril_loaded_comps(lc_output, nina_comps)]
+                        if nina_comps else ref_vmags)
+        n_used = siril_refs_used(lc_output)
+        ensemble_vmag: Optional[float] = None
+        if n_used is None or not loaded_vmags:
+            on_log("Apparent magnitude unavailable: the comparison stars used by "
+                   "Siril were not found in its log")
+        elif n_used != len(loaded_vmags):
+            on_log(f"Apparent magnitude unavailable: Siril kept {n_used} of "
+                   f"{len(loaded_vmags)} comparison stars (a star must be measured "
+                   "on at least 4/5 of the frames) and does not say which. Try "
+                   "fewer comp stars or a higher max pixel value.")
+        elif not all(v is not None and math.isfinite(v) for v in loaded_vmags):
+            on_log("Apparent magnitude unavailable: a comparison star has no "
+                   "catalogue V magnitude")
+        else:
+            ensemble_vmag = ensemble_zero_point(loaded_vmags)
+            on_log(f"Ensemble: {n_used} comparison stars, flux-mean catalogue "
+                   f"V = {ensemble_vmag:.3f}")
+
+        # AAVSO extended format (ensemble photometry, apparent magnitudes)
         # Airmass per point comes from the registered frame headers (AIRMASS keyword)
         airmass_map = build_airmass_map(proc, stem, seq_fixlen)
         if airmass_map:
             on_log(f"Airmass: read from {len(airmass_map)} frame headers")
         else:
             on_log("Airmass: no AIRMASS keyword in frame headers — AMASS left as 'na'")
-        rows = export_aavso(out_dat, out_csv, star["name"],
-                            filt_code=filt_code, filt_note=filt_note,
-                            airmass_map=airmass_map)
-        n_valid = len(rows)
-        n_total = sum(1 for ln in out_dat.read_text().splitlines()
-                      if ln and not ln.startswith("#"))
-        on_log(f"AAVSO CSV: {n_valid}/{n_total} pts exported "
-               f"(NaN and MERR>0.5 excluded)")
+        # Never leave a previous run's file behind when this one writes none.
+        if out_csv.exists():
+            out_csv.unlink()
+        try:
+            rows = export_aavso(out_dat, out_csv, star["name"],
+                                obscode=obscode, ensemble_vmag=ensemble_vmag,
+                                n_comps=n_used or 0,
+                                filt_code=filt_code, filt_note=filt_note,
+                                airmass_map=airmass_map)
+        except ValueError as e:
+            on_log(f"AAVSO CSV not written: {e}")
+        else:
+            n_total = sum(1 for ln in out_dat.read_text().splitlines()
+                          if ln and not ln.startswith("#"))
+            on_log(f"AAVSO CSV: {len(rows)}/{n_total} pts exported "
+                   f"(NaN and MERR>0.5 excluded)")
 
         # Simple photometry CSV with optional apparent magnitude
         n_phot = export_photometry_csv(out_dat, out_phot, star["name"], ensemble_vmag)
         if ensemble_vmag is not None:
-            on_log(f"Photometry CSV: {n_phot} pts, apparent V = V_C + {ensemble_vmag:.2f}")
+            on_log(f"Photometry CSV: {n_phot} pts, apparent V = V_C + {ensemble_vmag:.3f}")
         else:
-            on_log(f"Photometry CSV: {n_phot} pts (apparent mag unavailable — PRIMARY path)")
+            on_log(f"Photometry CSV: {n_phot} pts (apparent mag unavailable)")
 
         # FWHM per frame from registration .seq (plate scale ~1.035"/px for Seestar)
         out_fwhm = results_dir / "fwhm.csv"
