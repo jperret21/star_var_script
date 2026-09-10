@@ -10,7 +10,6 @@ Usage:
 
 import sys
 import socket
-import json
 
 # ── Try requests ──────────────────────────────────────────────────────────────
 try:
@@ -25,7 +24,6 @@ TEST_DEC = 69.09
 
 PASS = "✓  PASS"
 FAIL = "✗  FAIL"
-WARN = "⚠  WARN"
 
 results = []
 
@@ -110,33 +108,10 @@ if HAS_REQUESTS:
 else:
     check("VizieR APASS query", False, "requests not available")
 
-# ── 5. AAVSO VSX API (secondary, legacy) ─────────────────────────────────────
-print("\n[5] AAVSO VSX API  (secondary source — may be unreliable)")
-if HAS_REQUESTS:
-    try:
-        url = "https://vsx.aavso.org/index.php"
-        params = {"view": "api.list", "ra": TEST_RA, "dec": TEST_DEC,
-                  "radius": "30", "format": "json"}
-        r = requests.get(url, params=params, timeout=15, allow_redirects=True)
-        r.raise_for_status()
-        data = r.json()
-        objs = data.get("VSXObjects", {}).get("VSXObject", [])
-        if not isinstance(objs, list):
-            objs = [objs] if objs else []
-        check("AAVSO VSX API", True, f"{len(objs)} objects returned")
-    except json.JSONDecodeError as e:
-        check("AAVSO VSX API", False,
-              f"JSON parse error — API may be down. VizieR VSX will be used instead.")
-    except Exception as e:
-        check("AAVSO VSX API", False, f"{e} — VizieR VSX will be used instead.")
-else:
-    check("AAVSO VSX API", False, "requests not available")
-
-# ── 6. sirilpy ───────────────────────────────────────────────────────────────
-print("\n[6] Siril integration")
+# ── 5. sirilpy ───────────────────────────────────────────────────────────────
+print("\n[5] Siril integration")
 try:
     sys.path.insert(0, "/Applications/Siril.app/Contents/Resources/share/siril/python_module")
-    import sirilpy
     from sirilpy import SirilInterface
     iface = SirilInterface()
     iface.connect()
@@ -152,7 +127,7 @@ except Exception as e:
     check("sirilpy connect", False,
           f"{e}\nOpen Siril first, then run this script from Script > Run Script")
 
-# ── 7. siril-cli ──────────────────────────────────────────────────────────────
+# ── 6. siril-cli ──────────────────────────────────────────────────────────────
 import shutil
 cli = None
 for c in ["siril-cli", "/Applications/Siril.app/Contents/MacOS/siril-cli"]:

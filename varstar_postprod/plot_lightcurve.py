@@ -497,7 +497,6 @@ def plot_single(data: dict, quantity: str = "V", bin_min: float = 5.0,
 def plot_diagnostics(data: dict, sigma: float = 3.0) -> plt.Figure:
     """3-panel diagnostic figure: error histogram, mag–error scatter, mag histogram."""
     with plt.rc_context(RCPARAMS):
-        jd       = data["jd"]
         err      = data["err"]
         has_vapp = data["has_vapp"]
         star     = data["star_name"]
@@ -754,7 +753,7 @@ def main(argv: list[str] | None = None) -> None:
         data = load_photometry(csv_path)
 
         if len(data["jd"]) == 0:
-            print(f"  ⚠  No valid data points — skipping.")
+            print("  ⚠  No valid data points — skipping.")
             continue
 
         n  = len(data["jd"])

@@ -44,7 +44,7 @@ star_var_script/
 
 1. Open Siril and set your session folder (the one containing `lights/`)
 2. **Script → Run Script → `seestar_varstar_siril.py`**
-3. Load the session, pick a variable star, fetch comp stars, click **Run**
+3. Load the session, pick a variable star, enter your AAVSO observer code, click **Run** (comparison stars are fetched automatically)
 4. Results are written to `results/StarName/`
 
 After the pipeline completes, generate plots:

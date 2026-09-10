@@ -35,12 +35,10 @@ from pipeline import (  # noqa: E402
     find_siril_cli,
     read_fits_header,
     list_fits,
-    stars_in_frame,
     stars_in_safe_circle,
     find_siril_user_catalogue,
     update_siril_catalogue,
     query_vsx,
-    query_apass,
     run_pipeline,
     resolve_frame_dir,
 )
@@ -135,7 +133,6 @@ class App(tk.Tk):
         self.field_naxis1:   int             = 0
         self.field_naxis2:   int             = 0
         self.all_stars:      list[dict]      = []
-        self.comp_stars:     list[dict]      = []
         self.selected_star:  Optional[dict]  = None
         self.runner:         Optional[SirilRunner] = None
 
@@ -694,7 +691,6 @@ class App(tk.Tk):
         if not star:
             return
         self.selected_star = star
-        self.comp_stars = []
         self.lbl_name.configure(text=star["name"])
         self.lbl_type.configure(
             text=f"Type: {star.get('var_type','?')}   Period: {star.get('period','—')}"
@@ -802,7 +798,6 @@ class App(tk.Tk):
         config = {
             "session":    self.session_dir,
             "star":       self.selected_star,
-            "comp_stars": list(self.comp_stars),
             "nstars":     self.nstars_var.get(),
             "start_step": self._get_start_step(),
             "dark_dir":   Path(self.dark_var.get()) if self.dark_var.get().strip() else None,

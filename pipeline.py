@@ -32,7 +32,6 @@ except ImportError:
 try:
     import sys as _sys
     _sys.path.insert(0, "/Applications/Siril.app/Contents/Resources/share/siril/python_module")
-    import sirilpy
     from sirilpy import SirilInterface
     HAS_SIRILPY = True
 except ImportError:
@@ -189,25 +188,6 @@ def sky_to_pixel(ra: float, dec: float, hdr: dict):
         return px, py
     except (KeyError, ValueError, ZeroDivisionError):
         return None, None
-
-
-def stars_in_frame(stars: list[dict], wcs_hdr: dict,
-                   naxis1: int, naxis2: int,
-                   margin: int = 50) -> list[dict]:
-    """Return only stars whose sky coords project inside the image frame.
-
-    margin: minimum pixel distance from any edge. Set to at least the outer
-    photometry ring (30 px) so apertures don't clip at the boundary.
-    """
-    inside = []
-    for star in stars:
-        px, py = sky_to_pixel(star["ra"], star["dec"], wcs_hdr)
-        if px is None:
-            continue
-        if (margin < px <= naxis1 - margin and
-                margin < py <= naxis2 - margin):
-            inside.append(star)
-    return inside
 
 
 def stars_in_safe_circle(stars: list[dict], wcs_hdr: dict,
@@ -610,7 +590,6 @@ def export_fwhm_csv(seq_path: Path, proc: Path, stem: str,
                     frame_nums.append(int(parts[1]))
                     selected.append(parts[2].strip() == "1")
         # R0 lines appear in the same order as I lines
-        r0_idx = 0
         r0_data: list[tuple[float, float]] = []
         with open(seq_path, encoding="utf-8") as f:
             for line in f:
@@ -1231,7 +1210,6 @@ def run_pipeline(config: dict,
     config keys:
       session    (Path)             session root folder
       star       (dict)             {name, ra, dec, mag, …}
-      comp_stars (list[dict])       fallback comparison stars from APASS
       nstars     (int)              max comparison stars for findcompstars
       start_step (int)              1, 3, 4, or 5
       dark_dir   (Optional[Path])
@@ -1260,7 +1238,7 @@ def run_pipeline(config: dict,
     """
     session    = config["session"]
     star       = config["star"]
-    comp_stars = list(config.get("comp_stars", []))
+    comp_stars: list[dict] = []   # filled from APASS by FALLBACK A
     nstars     = config.get("nstars", 10)
     start_step = config.get("start_step", 1)
     filt_code  = config.get("filt_code", "CV")
@@ -1609,7 +1587,7 @@ def run_pipeline(config: dict,
     # dvmag=3.5: VSX reports max brightness, star may be 1-2 mag fainter at minimum.
     if lc_cmd is None and ref_img_num is not None:
         if not comp_stars:
-            on_log(f"[FALLBACK A] querying APASS (radius=1.5°, dvmag=3.5) …")
+            on_log("[FALLBACK A] querying APASS (radius=1.5°, dvmag=3.5) …")
             comp_stars = query_apass(star["ra"], star["dec"], star["mag"],
                                      radius_deg=1.5, n=nstars, dvmag=3.5)
             if comp_stars:
