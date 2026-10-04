@@ -690,7 +690,10 @@ def save_fig(fig: plt.Figure, out_dir: Path, stem: str, fmt: str) -> list[Path]:
     saved = []
     for f in (["pdf", "png"] if fmt == "both" else [fmt]):
         p = out_dir / f"{stem}.{f}"
-        fig.savefig(p, format=f)
+        # The plot functions apply RCPARAMS only while drawing; savefig reads
+        # savefig.dpi / bbox / pad_inches at save time, so apply them here too.
+        with plt.rc_context(RCPARAMS):
+            fig.savefig(p, format=f)
         saved.append(p)
     plt.close(fig)
     return saved
