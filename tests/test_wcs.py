@@ -1,4 +1,4 @@
-"""Tests for sky_to_pixel, stars_in_safe_circle and stars_in_frame."""
+"""Tests for sky_to_pixel, stars_in_safe_circle, stars_in_frame and plate_scale_arcsec."""
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import math
 import unittest
 
-from pipeline import sky_to_pixel, stars_in_frame, stars_in_safe_circle
+from pipeline import plate_scale_arcsec, sky_to_pixel, stars_in_frame, stars_in_safe_circle
 
 
 def _cdelt_hdr(crval1, crval2, crpix1, crpix2, cdelt_deg):
@@ -32,7 +32,7 @@ def _cd_hdr(crval1, crval2, crpix1, crpix2, cdelt_deg):
 
 class TestSkyToPixel(unittest.TestCase):
 
-    SEESTAR_CDELT = 2.9e-3 / 160 * (180 / math.pi)  # ~1.035 arcsec/pix in degrees
+    SEESTAR_CDELT = 2.9e-3 / 160 * (180 / math.pi)  # 1.0385e-3 deg/px = 3.74 arcsec/px
 
     # ── Invariant: projecting CRVAL gives back CRPIX ─────────────────────────
 
@@ -237,6 +237,27 @@ class TestStarsInSafeCircle(unittest.TestCase):
         s = self._star(145.3213, 68.9214, "NSVS")
         result = stars_in_safe_circle([s], self.HDR, self.W, self.H, margin=0)
         self.assertEqual(len(result), 0)
+
+
+
+class TestPlateScale(unittest.TestCase):
+
+    def test_cdelt_header(self):
+        hdr = _cdelt_hdr(291.4, 41.9, 917.5, 1126.0, 1.0204e-3)
+        self.assertAlmostEqual(plate_scale_arcsec(hdr), 3.673, places=3)
+
+    def test_cd_header(self):
+        hdr = _cd_hdr(291.4, 41.9, 461.5, 562.0, 2.0413e-3)
+        self.assertAlmostEqual(plate_scale_arcsec(hdr), 7.349, places=3)
+
+    def test_rotation_does_not_change_scale(self):
+        c, s = math.cos(math.radians(3.3)), math.sin(math.radians(3.3))
+        hdr = _cdelt_hdr(291.4, 41.9, 917.5, 1126.0, 1.0204e-3)
+        hdr.update({"PC1_1": c, "PC1_2": -s, "PC2_1": -s, "PC2_2": -c})
+        self.assertAlmostEqual(plate_scale_arcsec(hdr), 3.673, places=3)
+
+    def test_no_wcs(self):
+        self.assertIsNone(plate_scale_arcsec({}))
 
 
 

@@ -264,7 +264,7 @@ class App(tk.Tk):
         flt_row.pack(fill="x", pady=(0, 4))
         tk.Label(flt_row, text="Filter:", bg=BG, fg=FG2,
                  font=("Helvetica", 11), width=9, anchor="w").pack(side="left")
-        self.obs_filter_var = tk.StringVar(value="LP anti-pollution filter (CV)")
+        self.obs_filter_var = tk.StringVar(value="Green channel — IR-cut or no filter (TG)")
         ttk.Combobox(flt_row, textvariable=self.obs_filter_var,
                      values=list(FILTER_OPTIONS.keys()),
                      state="readonly", width=30,
@@ -351,8 +351,8 @@ class App(tk.Tk):
         phot_card.pack(fill="x", pady=(0, 6))
 
         self.ap_var      = tk.DoubleVar(value=10.0)
-        self.inner_var   = tk.DoubleVar(value=20.0)
-        self.outer_var   = tk.DoubleVar(value=30.0)
+        self.inner_var   = tk.DoubleVar(value=10.0)
+        self.outer_var   = tk.DoubleVar(value=15.0)
         self.dyn_var     = tk.DoubleVar(value=4.0)
         self.maxval_var  = tk.DoubleVar(value=60000.0)
 
@@ -368,10 +368,10 @@ class App(tk.Tk):
         pr1.pack(fill="x", pady=(0, 4))
         tk.Label(pr1, text="Inner:", bg=BG, fg=FG2, font=("Helvetica", 11),
                  width=9, anchor="w").pack(side="left")
-        _phot_spin(pr1, self.inner_var, 3, 300, 5).pack(side="left", padx=(0, 8))
+        _phot_spin(pr1, self.inner_var, 3, 150, 1).pack(side="left", padx=(0, 8))
         tk.Label(pr1, text="Outer:", bg=BG, fg=FG2, font=("Helvetica", 11),
                  anchor="w").pack(side="left")
-        _phot_spin(pr1, self.outer_var, 5, 400, 5).pack(side="left", padx=(4, 0))
+        _phot_spin(pr1, self.outer_var, 5, 200, 1).pack(side="left", padx=(4, 0))
 
         pr2 = self._row(phot_card)
         pr2.pack(fill="x", pady=(0, 4))
@@ -875,7 +875,7 @@ class App(tk.Tk):
 
     def _pipeline_bg(self):
         filt_key = self.obs_filter_var.get()
-        filt_code, filt_note = FILTER_OPTIONS.get(filt_key, ("CV", ""))
+        filt_code, filt_note = FILTER_OPTIONS.get(filt_key, ("TG", ""))
         config = {
             "session":    self.session_dir,
             "star":       self.selected_star,

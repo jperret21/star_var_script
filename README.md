@@ -6,6 +6,7 @@ Automated pipeline for variable star differential photometry with the **ZWO Sees
 
 ## Features
 
+- **Green-channel photometry** — the Bayer green, (G1+G2)/2, extracted with `seqextract_Green` before registration; reported to AAVSO as `TG`
 - **Automatic target discovery** — queries VizieR/VSX to find all known variable stars in the field
 - **Ensemble differential photometry** — APASS comparison stars fetched automatically from VizieR, or the AAVSO VSP comparison and check stars chosen in [Argos](https://github.com/jperret21/argos) for an Argos session
 - **Approximate apparent V magnitude** — computed from APASS catalog magnitudes of comp stars
@@ -19,7 +20,7 @@ Automated pipeline for variable star differential photometry with the **ZWO Sees
 ```
 Seestar FITS frames
     ↓
-  Siril: calibrate → register → plate-solve → aperture photometry
+  Siril: calibrate → green channel → register → plate-solve → aperture photometry
     ↓
   photometry.csv  ·  fwhm.csv  ·  aavso.csv
     ↓

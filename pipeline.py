@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 
 # ── optional runtime deps ────────────────────────────────────────────────────
 
@@ -58,10 +58,12 @@ SEESTAR = {
 
 VIZIER = "https://vizier.cds.unistra.fr/viz-bin/asu-tsv"
 
-# AAVSO filter codes — (code, extra_note)
+# AAVSO filter codes — (code, extra_note). The photometry is done on the Bayer
+# green channel, (G1+G2)/2, so a Seestar session is reported as TG whatever its
+# filter wheel position; the LP filter is only mentioned in the notes.
 FILTER_OPTIONS: dict[str, tuple[str, str]] = {
-    "Clear — no filter (CV)":         ("CV",  ""),
-    "LP anti-pollution filter (CV)":  ("CV",  "LP_filter_Seestar_S30Pro"),
+    "Green channel — IR-cut or no filter (TG)":  ("TG",  ""),
+    "Green channel — LP filter (TG)":            ("TG",  "LP_filter_Seestar_S30Pro"),
     "V Johnson":                       ("V",   ""),
     "B Johnson":                       ("B",   ""),
     "R Cousins (Rc)":                  ("R",   ""),
@@ -708,16 +710,17 @@ def _read_lc_dat(dat: Path) -> list[tuple[float, float, float]]:
 
 def export_fwhm_csv(seq_path: Path, proc: Path, stem: str,
                     fixlen: int, out: Path,
-                    plate_scale_arcsec: float = 1.035) -> int:
+                    plate_scale_arcsec: float) -> int:
     """Extract per-frame FWHM from a Siril .seq file and write fwhm.csv.
 
-    The .seq R0 lines contain FWHM in pixels from the registration star detection.
+    The .seq R0 lines hold the mean FWHM and the weighted FWHM, in pixels, from
+    the registration star detection; *plate_scale_arcsec* converts them.
     Each R0 line is matched to its frame via the corresponding I line.
     DATE-OBS is read from each FITS header to build the JD axis.
 
     Returns number of rows written (0 on failure).
     """
-    # Parse .seq: build list of (frame_num, selected, fwhm_x, fwhm_y)
+    # Parse .seq: build list of (frame_num, selected, fwhm, weighted_fwhm)
     entries: list[tuple[int, bool, float, float]] = []
     try:
         frame_nums: list[int] = []
@@ -734,7 +737,7 @@ def export_fwhm_csv(seq_path: Path, proc: Path, stem: str,
             for line in f:
                 if line.startswith("R0 "):
                     parts = line.split()
-                    # R0 fwhm_x fwhm_y roundness ...
+                    # R0 fwhm weighted_fwhm roundness quality background nbstars H …
                     r0_data.append((float(parts[1]), float(parts[2])))
         for i, (fn, sel) in enumerate(zip(frame_nums, selected)):
             if i < len(r0_data):
@@ -747,7 +750,7 @@ def export_fwhm_csv(seq_path: Path, proc: Path, stem: str,
         return 0
 
     # Read DATE-OBS from each selected FITS header → JD
-    rows: list[tuple[float, float, float]] = []   # (jd, fwhm_x_as, fwhm_y_as)
+    rows: list[tuple[float, float, float]] = []   # (jd, fwhm_as, wfwhm_as)
     for fn, sel, fx, fy in entries:
         if not sel or fx <= 0:
             continue
@@ -771,7 +774,7 @@ def export_fwhm_csv(seq_path: Path, proc: Path, stem: str,
         with open(out, "w", newline="", encoding="utf-8") as f:
             f.write("# FWHM per frame from Siril registration star detection\n")
             f.write(f"# Plate scale: {plate_scale_arcsec:.4f} arcsec/px\n")
-            f.write("JD,FWHM_x_arcsec,FWHM_y_arcsec\n")
+            f.write("JD,FWHM_arcsec,wFWHM_arcsec\n")
             for jd, fx, fy in rows:
                 f.write(f"{jd:.6f},{fx:.3f},{fy:.3f}\n")
     except Exception:
@@ -994,6 +997,21 @@ def get_gain_eadu(lights_dir: Path) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 # AAVSO export
 # ─────────────────────────────────────────────────────────────────────────────
+
+def plate_scale_arcsec(hdr: dict) -> Optional[float]:
+    """Pixel scale in arcsec/px from a FITS WCS (CD matrix, or CDELT + PC)."""
+    try:
+        if "CD1_1" in hdr:
+            det = (float(hdr["CD1_1"]) * float(hdr["CD2_2"])
+                   - float(hdr["CD1_2"]) * float(hdr["CD2_1"]))
+        else:
+            det = (float(hdr["CDELT1"]) * float(hdr["CDELT2"])
+                   * (float(hdr.get("PC1_1", 1.0)) * float(hdr.get("PC2_2", 1.0))
+                      - float(hdr.get("PC1_2", 0.0)) * float(hdr.get("PC2_1", 0.0))))
+    except (KeyError, ValueError, TypeError):
+        return None
+    return math.sqrt(abs(det)) * 3600.0 if det else None
+
 
 def build_airmass_map(proc: Path, stem: str, fixlen: int) -> list[tuple[float, float]]:
     """Build a per-frame (JD, airmass) table from the registered FITS headers.
@@ -1386,8 +1404,8 @@ def run_pipeline(config: dict,
                                     circle (def False)
       runner     (SirilRunner)
       phot_aperture  (float)        setphot forced-aperture radius px (def 10)
-      phot_inner     (float)        sky-annulus inner radius px (def 20)
-      phot_outer     (float)        sky-annulus outer radius px (def 30)
+      phot_inner     (float)        sky-annulus inner radius, green px (def 10)
+      phot_outer     (float)        sky-annulus outer radius, green px (def 15)
       phot_dyn_ratio (float)        dynamic aperture = 0.5*FWHM*ratio (def 4.0)
       phot_min_val   (float)        min valid pixel value (def -1000; registered
                                     frames are background-subtracted so sky sits
@@ -1418,8 +1436,8 @@ def run_pipeline(config: dict,
     # Defaults reproduce the historical hard-coded values.
     phot = {
         "aperture":  float(config.get("phot_aperture",  10.0)),
-        "inner":     float(config.get("phot_inner",     20.0)),
-        "outer":     float(config.get("phot_outer",     30.0)),
+        "inner":     float(config.get("phot_inner",     10.0)),
+        "outer":     float(config.get("phot_outer",     15.0)),
         "dyn_ratio": float(config.get("phot_dyn_ratio",  4.0)),
         "min_val":   float(config.get("phot_min_val", -1000.0)),
         "max_val":   float(config.get("phot_max_val", 60000.0)),
@@ -1502,31 +1520,38 @@ def run_pipeline(config: dict,
                    "dark subtraction may be inaccurate.")
 
     focal = SEESTAR["focal"]
-    pixsz = SEESTAR["pixsz"]
-    gain  = get_gain_eadu(lights)
-    on_log(f"Gain: {gain} e-/ADU")
+    # The green image averages the two green pixels of each Bayer cell: its
+    # pixels are twice as large, and one of its ADU holds twice the electrons
+    # (seqextract_Green drops EGAIN, so setphot -gain is what Siril uses).
+    pixsz = 2 * SEESTAR["pixsz"]
+    raw_gain = get_gain_eadu(lights)
+    gain  = round(2 * raw_gain, 3)
+    on_log(f"Gain: {raw_gain} e-/ADU per raw pixel → {gain} e-/ADU for the green "
+           "channel (G1+G2)/2")
 
     # ── Jump to step 3/4/5 — detect existing registered sequence ─────────────
+    # Sequences made before v0.1.7 are the Bayer mosaic (light_, r_light_):
+    # resuming from them would mix the colours, so only green ones are reused.
     if start_step == 3:
-        for candidate in ("pp_light_", "light_"):
+        for candidate in ("Green_pp_light_", "Green_light_"):
             if (proc / f"{candidate}.seq").exists():
                 seq = candidate
                 break
         else:
             on_done(False,
-                    f"No registered sequence (light_.seq) found in {proc.name}/.\n"
+                    f"No green-channel sequence (Green_light_.seq) found in {proc.name}/.\n"
                     "Run the full pipeline first (steps 1–5).")
             return
         registered = f"r_{seq}"
 
     if start_step >= 4:
-        for candidate in ("r_pp_light_", "r_light_"):
+        for candidate in ("r_Green_pp_light_", "r_Green_light_"):
             if (proc / f"{candidate}.seq").exists():
                 registered = candidate
                 break
         else:
             on_done(False,
-                    f"No registered sequence found in {proc.name}/.\n"
+                    f"No registered green-channel sequence found in {proc.name}/.\n"
                     "Run the full pipeline first (steps 1–5).")
             return
         on_log(f"Resuming from step {start_step} — sequence: {registered}")
@@ -1575,8 +1600,9 @@ def run_pipeline(config: dict,
                 for k in ("bias", "dark", "flat") if k in calib_dirs
             )
             # Cosmetic correction detects hot/cold pixels from the master dark;
-            # it requires -dark, so only enable it when a dark is present.
-            cc = " -cc=dark" if "dark" in calib_dirs else ""
+            # it requires -dark, so only enable it when a dark is present. -cfa
+            # replaces a bad pixel with same-colour neighbours.
+            cc = " -cc=dark -cfa" if "dark" in calib_dirs else ""
             calib_cmds += [f'cd "{proc}"', f"calibrate light_ {cal_flags}{cc}"]
             if not runner.run_script(proc, calib_cmds, "_s0_calibrate.ssf"):
                 on_done(False, "Step 0 failed (calibration)")
@@ -1586,7 +1612,21 @@ def run_pipeline(config: dict,
             on_log("No calibration frames — proceeding with raw lights.")
             seq = "light_"
 
-        # ── Step 2: register the (calibrated) sequence ────────────────────────
+        # ── Step 1b: green channel ────────────────────────────────────────────
+        # Photometry is done on the Bayer green channel, (G1+G2)/2, at half
+        # resolution: a defined band (TG), no interpolation across colours at
+        # registration, and DATE-OBS kept (BAYERPAT is gone).
+        on_progress(26, "Extracting green channel…")
+        on_log("─── Step 1b: seqextract_Green ───")
+        if not runner.run_script(proc, [
+            f'cd "{proc}"',
+            f"seqextract_Green {seq}",
+        ], "_s1b_green.ssf"):
+            on_done(False, "Step 1b failed (seqextract_Green)")
+            return
+        seq = f"Green_{seq}"
+
+        # ── Step 2: register the green sequence ───────────────────────────────
         on_progress(30, "Computing registration…")
         on_log("─── Step 2: register -2pass ───")
         if not runner.run_script(proc, [
@@ -1617,21 +1657,7 @@ def run_pipeline(config: dict,
             on_done(False, "Step 3 failed (seqapplyreg)")
             return
 
-    # ── Step 4: plate solve ───────────────────────────────────────────────────
-    if start_step <= 4:
-        on_progress(65, "Plate solving registered frames…")
-        on_log("─── Step 4: seqplatesolve ───")
-        disto = proc / "ps_distortion"
-        disto_arg = "-disto=ps_distortion" if disto.is_dir() else ""
-        if not runner.run_script(proc, [
-            f'cd "{proc}"',
-            f"seqplatesolve {registered} -nocache -force "
-            f"-focal={focal} -pixelsize={pixsz} -radius=2.5 {disto_arg}".strip(),
-        ], "_s4_platesolve.ssf"):
-            on_log("WARNING: plate solve had errors — continuing")
-
-    # ── Step 5: sequence integrity + photometry ───────────────────────────────
-    on_progress(82, "Checking sequence integrity…")
+    # ── Registered sequence: frames and reference ─────────────────────────────
 
     seq_file    = proc / f"{registered}.seq"
     stem        = registered.rstrip("_")
@@ -1667,6 +1693,27 @@ def run_pipeline(config: dict,
     if seq_ref_idx is not None and seq_ref_idx < len(img_entries):
         ref_img_num = img_entries[seq_ref_idx][0]
 
+    # ── Step 4: plate solve the reference frame ───────────────────────────────
+    # The frames are registered on the reference frame, so its WCS places the
+    # stars on all of them: light_curve projects -ninastars on the reference.
+    # seqplatesolve would solve every frame and drop from the sequence those it
+    # cannot solve — about half of the undersampled green frames.
+    if start_step <= 4:
+        on_progress(65, "Plate solving the reference frame…")
+        on_log("─── Step 4: platesolve (reference frame) ───")
+        if ref_img_num is None:
+            on_log("WARNING: no reference frame in the sequence — plate solve skipped")
+        else:
+            ref_name = f"{stem}_{ref_img_num:0{seq_fixlen}d}"
+            if not runner.run_script(proc, [
+                f'cd "{proc}"',
+                f"load {ref_name}",
+                f"platesolve -force -noflip -focal={focal} -pixelsize={pixsz:g}",
+                f"save {ref_name}",
+            ], "_s4_platesolve.ssf"):
+                on_log("WARNING: plate solve of the reference frame failed — continuing")
+
+    # ── Step 5: photometry ────────────────────────────────────────────────────
     on_progress(85, "Aperture photometry…")
     on_log("─── Step 5: setphot + light_curve ───")
 
@@ -1904,10 +1951,10 @@ def run_pipeline(config: dict,
         stale_dat.unlink()
         on_log("Removed stale light_curve.dat from previous run")
 
-    # Strip BAYERPAT before light_curve to work around a Siril 1.4.3 bug:
-    # copyfits(CP_FORMAT) clears date_obs in the CFA copy used for PSF fitting,
-    # so seq->imgparam[i].date_obs is never populated → JD axis shows frame indices.
-    # Without BAYERPAT, Siril skips the CFA copy and reads date_obs correctly.
+    # Strip BAYERPAT before light_curve: on a CFA image Siril photometers a copy
+    # made with copyfits(CP_FORMAT), which clears date_obs, so the JD axis shows
+    # frame indices. Green-channel frames carry no BAYERPAT, so this is a no-op
+    # for them; it stays as a guard.
     bayer_stripped: dict[Path, tuple[int, str]] = {}
     for fit_path in sorted(proc.glob(f"{stem}_*.fit")):
         result = _fits_strip_keyword(fit_path, "BAYERPAT")
@@ -2091,10 +2138,11 @@ def run_pipeline(config: dict,
         else:
             on_log(f"Photometry CSV: {n_phot} pts (apparent mag unavailable)")
 
-        # FWHM per frame from registration .seq (plate scale ~1.035"/px for Seestar)
+        # FWHM per frame from the registration .seq, at the plate-solved scale
         out_fwhm = results_dir / "fwhm.csv"
+        scale = plate_scale_arcsec(ref_hdr) or 206.265 * pixsz / focal
         n_fwhm = export_fwhm_csv(seq_file, proc, stem, seq_fixlen, out_fwhm,
-                                  plate_scale_arcsec=1.035)
+                                  plate_scale_arcsec=scale)
         if n_fwhm:
             on_log(f"FWHM CSV: {n_fwhm} frames written → {out_fwhm.name}")
         else:

@@ -6,6 +6,7 @@
 
 | Version | Changes |
 |---------|---------|
+| v0.1.7 | Photometry on the Bayer green channel (`seqextract_Green` before registration, AAVSO filter `TG`); plate solve of the reference frame only; green-channel gain; FWHM in arcsec from the plate solution |
 | v0.1.6 | AAVSO export accepted by WebObs (commented column line, `STD` apparent magnitudes, observer code); V_app from the flux mean of the comp stars Siril used |
 | v0.1.5 | PRIMARY path via `findcompstars` + `-ninastars`; ensemble V_app; FWHM from `.seq` |
 | v0.1.4 | Frame border safety margin raised to 200 px |
@@ -16,7 +17,7 @@
 
 ---
 
-## v0.1.6 — How it works
+## v0.1.7 — How it works
 
 ### 1. Session path
 
@@ -38,7 +39,7 @@ After selecting a target from the table, the script uses the comparison and chec
 
 ### 4. Filter and calibration frames
 
-**Filter:** choice between LP (Seestar default) or no filter. Only affects the `FILT` field in the AAVSO export (`CV` in both cases — neither matches a standard photometric band).
+**Filter:** the photometry is done on the Bayer green channel, so the AAVSO `FILT` field is `TG` whatever the filter wheel position. Choosing the LP option only adds a note to the export.
 
 **Obscode:** your AAVSO observer code. Without it no `aavso.csv` is written (see [AAVSO export](#aavso-export)).
 
@@ -50,56 +51,58 @@ After selecting a target from the table, the script uses the comparison and chec
 link dark_ → stack dark_ rej 3 3 -nonorm  → master_dark.fit
 link flat_  → stack flat_  rej 3 3 -norm=mul → master_flat.fit
 link bias_  → stack bias_  rej 3 3 -nonorm  → master_bias.fit
-calibrate light_ -dark=... -flat=... -bias=...  → pp_light_*.fit
+calibrate light_ -dark=... -flat=... -bias=... -cc=dark -cfa  → pp_light_*.fit
 ```
 
 Stacking uses Winsorized sigma clipping 3σ, robust against cosmic rays and satellite trails. Without calibration, the active sequence stays `light_`.
 
 ### 5. Run — steps and algorithms
 
-**Steps 1+2 — Registration**
+**Step 1 — Sequence and green channel**
 
 ```
 link light -out=process/
-register light_ -2pass
+seqextract_Green light_        →  Green_light_*.fit   (or Green_pp_light_ after calibration)
 ```
 
-`register -2pass` does offline star-pattern matching. The transform computed per frame is a similarity: translation + rotation + uniform scale — no distortion correction. Results (transform matrices) are written to `light_.seq`.
+`seqextract_Green` keeps the two green pixels of each GRBG cell and averages them, (G1+G2)/2, in a half-resolution image (1080 × 1920 px, 5.8 µm pixels, 7.35″/px). The photometric band is the Bayer green (AAVSO `TG`), the same plane as the Argos live curve. `BAYERPAT` is removed and `DATE-OBS`, `EXPTIME`, `AIRMASS` are kept.
 
-**Step 3 — Apply transforms**
+Before v0.1.7 the frames stayed CFA: registration interpolated the mosaic as a mono image and the aperture summed red, green and blue pixels — a broad band reported as `CV`.
 
-```
-seqapplyreg light_ -framing=max -filter-round=2.5k  →  r_light_*.fit
-```
-
-`-framing=max`: output frames use the union of all fields of view, so they are larger than the input. Stars near the edges appear in fewer frames — hence the 200 px border exclusion for comp star selection (v0.1.4).
-
-`-filter-round=2.5k`: keeps the 2500 best frames by star elongation. On a typical Seestar session of 200–500 frames this usually rejects nothing, but guards against wind-shake or satellite trail frames.
-
-**Step 4 — Per-frame plate solve**
+**Steps 2+3 — Registration**
 
 ```
-seqplatesolve r_light_ -nocache -force -focal=160 -pixelsize=2.9 -radius=2.5
+register Green_light_ -2pass
+seqapplyreg Green_light_ -framing=min -filter-round=2.5k  →  r_Green_light_*.fit
 ```
 
-Each frame gets its own astrometric solution against the Gaia DR3 catalog (online). WCS headers (`CRVAL`, `CRPIX`, `CD` matrix) are written into every `r_light_*.fit`. Required because after `-framing=max`, the reference frame WCS does not apply to the others.
+`register -2pass` detects the stars, picks the reference frame (FWHM, star count) and computes a homography per frame, written to the `.seq` only. `seqapplyreg` writes the aligned frames (Lanczos4 interpolation), cropped to the area common to all frames (`-framing=min`); `-filter-round=2.5k` drops frames whose roundness is more than 2.5σ below the median.
+
+**Step 4 — Plate solve of the reference frame**
+
+```
+load r_Green_light_<ref>
+platesolve -force -noflip -focal=160 -pixelsize=5.8
+save r_Green_light_<ref>
+```
+
+The frames are aligned on the reference frame, so its WCS places the stars on all of them: `light_curve` projects the `-ninastars` coordinates on the reference image. `seqplatesolve` is not used: it drops from the sequence every frame it cannot solve — about half of the undersampled green frames in a test session.
 
 **Step 5 — Photometry**
 
 ```
-findcompstars <target> -catalog=APASS -narrowband=0 -max_stars=N  →  comp_stars.csv
-setphot -aperture=10 -inner=20 -outer=30 -gain=1.0
-light_curve r_light_ 0 -ninastars=comp_stars.csv
+setphot -aperture=10 -inner=10 -outer=15 -dyn_ratio=4 -min_val=-1000 -max_val=60000 -gain=<2 × EGAIN>
+light_curve r_Green_light_ 0 -ninastars=comp_stars.csv
 ```
 
-`light_curve` runs aperture photometry on every frame. Channel `0` is the only layer in the mono frames produced by CFA registration. Raw output is `light_curve.dat` (JD, V-C, error).
+The aperture is dynamic, `0.5 × dyn_ratio × FWHM` = 2 FWHM for each star on each frame (`-aperture` only applies to a forced radius). The sky annulus is 10–15 green pixels (73″–110″). `light_curve` fits each star, measures it in the aperture and computes V−C against the mean flux of the comparison stars. Raw output is `light_curve.dat` (JD at mid-exposure, V−C, error).
 
 **Python post-processing**
 
 After Siril exits, the Python pipeline:
 1. Reads `light_curve.dat`
 2. Computes `V_app = V_C + C_cat`, `C_cat` being the flux mean of the catalogue V magnitudes of the comp stars Siril used (see [V_app](#v_app-and-the-lp-filter-bias))
-3. Extracts per-frame FWHM from `r_light_.seq` (R0 lines), aligns with `DATE-OBS` from FITS headers, converts to arcsec
+3. Extracts per-frame FWHM from the `.seq` R0 lines (mean and weighted FWHM, in pixels), aligns with `DATE-OBS` from FITS headers, converts to arcsec with the scale of the plate solution
 4. Writes result files
 
 ### 6. Output
@@ -107,7 +110,7 @@ After Siril exits, the Python pipeline:
 ```
 results/StarName/
 ├── photometry.csv       JD, V_C, V_app, err
-├── fwhm.csv             JD, FWHM_x_arcsec, FWHM_y_arcsec
+├── fwhm.csv             JD, FWHM_arcsec, wFWHM_arcsec
 └── aavso.csv            AAVSO Extended Format (only when it can be submitted)
 ```
 
@@ -121,9 +124,9 @@ JD,V_C,V_app,err
 
 `fwhm.csv`:
 ```
-# Plate scale: 1.0350 arcsec/px
-JD,FWHM_x_arcsec,FWHM_y_arcsec
-2461161.334643,4.520,4.310
+# Plate scale: 7.3488 arcsec/px
+JD,FWHM_arcsec,wFWHM_arcsec
+2461309.336766,11.896,15.215
 ```
 
 ---
@@ -171,12 +174,12 @@ V_C is unaffected by the LP filter (target and comp stars go through the same fi
 ```
 #TYPE=EXTENDED
 #OBSCODE=ABC
-#SOFTWARE=Siril+seestar_varstar_siril.py v0.1.6
+#SOFTWARE=Siril+seestar_varstar_siril.py v0.1.7
 #DELIM=,
 #DATE=JD
 #OBSTYPE=CCD
 #NAME,DATE,MAG,MERR,FILT,TRANS,MTYPE,CNAME,CMAG,KNAME,KMAG,AMASS,GROUP,CHART,NOTES
-ES UMa,2461161.334643,11.707,0.021,CV,NO,STD,ENSEMBLE,na,na,na,1.302,na,APASS DR9,Seestar S30 Pro; Siril ensemble of 3 APASS DR9 comparison stars (flux-mean V=12.119); no check star; LP_filter_Seestar_S30Pro
+ES UMa,2461161.334643,11.707,0.021,TG,NO,STD,ENSEMBLE,na,na,na,1.302,na,APASS DR9,Seestar S30 Pro; Siril ensemble of 3 APASS DR9 comparison stars (flux-mean V=12.119); no check star; LP_filter_Seestar_S30Pro
 ```
 
 | Field | Value | Why |
@@ -214,17 +217,14 @@ ES UMa,2461161.334643,11.707,0.021,CV,NO,STD,ENSEMBLE,na,na,na,1.302,na,APASS DR
 ## Plate scale
 
 ```
-206.265 * 2.9 µm / 160 mm = 3.74 arcsec/px   (raw Bayer pixel)
+206.265 * 2.9 µm / 160 mm = 3.74 arcsec/px   (raw Bayer pixel, nominal)
+206.265 * 5.8 µm / 160 mm = 7.48 arcsec/px   (green-channel pixel, nominal)
 ```
 
-The value used for FWHM `.seq` → arcsec conversion is **1.035 arcsec/px** — the Seestar internally stacks 10s sub-exposures with slight drizzle, which shifts the effective pixel scale.
-
-> TODO: verify 1.035 empirically from the CD matrix of a plate-solved frame.
-
----
+The plate solution of a test session gives 3.673″/px on the raw mosaic and 7.349″/px on the green channel (effective focal length ≈ 163 mm). `fwhm.csv` uses the scale of the reference frame's WCS.
 
 ## Gain e⁻/ADU
 
-`get_gain_eadu()` tries headers in order: `EGAIN`, `EPERDN`, `GAIN_E`, `CCDGAIN`, then `GAIN`. Value accepted only if `0.05 < g < 30`. The Seestar writes `GAIN=200` (camera setting, not e⁻/ADU) — rejected by this range, falls back to **1.0 e⁻/ADU**.
+`get_gain_eadu()` tries headers in order: `EGAIN`, `EPERDN`, `GAIN_E`, `CCDGAIN`, then `GAIN`. Value accepted only if `0.05 < g < 30`; otherwise 1.0 e⁻/ADU. Argos writes `EGAIN` (the Alpaca driver value, 0.8 e⁻/ADU at gain 80).
 
-Physical IMX585 value at gain 200: ~0.5–0.7 e⁻/ADU. Error bars are therefore ~20–40% too wide — conservative and harmless for differential photometry. The Seestar control app should write `EGAIN` into FITS headers; `get_gain_eadu()` will pick it up automatically.
+A green-channel pixel is the mean of two raw pixels: one of its ADU holds twice the electrons, so `setphot -gain` receives twice the raw gain. `seqextract_Green` drops `EGAIN`, so Siril uses this value.
