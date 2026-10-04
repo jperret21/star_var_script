@@ -225,6 +225,26 @@ def stars_in_safe_circle(stars: list[dict], wcs_hdr: dict,
     return inside
 
 
+def stars_in_frame(stars: list[dict], wcs_hdr: dict,
+                   naxis1: int, naxis2: int,
+                   margin: int = 50) -> list[dict]:
+    """Return stars inside the frame rectangle, at least `margin` px from the edge.
+
+    For equatorial mounts there is no field rotation, so the whole frame is
+    covered by every registered frame — only the edge limits the photometry.
+    """
+    if not wcs_hdr:
+        return stars
+    inside = []
+    for star in stars:
+        px, py = sky_to_pixel(star["ra"], star["dec"], wcs_hdr)
+        if px is None:
+            continue
+        if margin < px - 0.5 < naxis1 - margin and margin < py - 0.5 < naxis2 - margin:
+            inside.append(star)
+    return inside
+
+
 def find_siril_user_catalogue() -> Optional[Path]:
     """Return path to Siril's user-DSO-catalogue.csv, or None if not found."""
     system = platform.system()
@@ -375,11 +395,16 @@ def query_apass(ra: float, dec: float, target_mag: float,
 
     dvmag: max magnitude difference from target. Use 3.5+ when target_mag
     comes from VSX (which stores max brightness, often 1-2 mag brighter than mean).
+
+    The magnitude range is filtered by VizieR: rows come sorted by distance
+    and capped at max_rows, so filtering here instead would only see the few
+    hundred nearest (mostly faint) stars — for a bright target, none in range.
     """
     rows = _vizier_tsv(
         "II/336/apass9", ra, dec, radius_deg * 60,
         ["RAJ2000", "DEJ2000", "Vmag", "e_Vmag"],
-        filters={"e_Vmag": "<0.05"},
+        filters={"e_Vmag": "<0.05",
+                 "Vmag": f"{target_mag - dvmag:.2f}..{target_mag + dvmag:.2f}"},
         max_rows=200,
     )
     comps = []
@@ -400,6 +425,10 @@ def query_apass(ra: float, dec: float, target_mag: float,
             continue
     comps.sort(key=lambda c: abs(c["vmag"] - target_mag))
     return comps[:n]
+
+
+# APASS candidates fetched by FALLBACK A/B; the in-frame ones are then cut to nstars.
+APASS_CANDIDATES = 50
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1351,6 +1380,10 @@ def run_pipeline(config: dict,
       argos_selection (Optional[Path]) Argos photometry_selection.json: its
                                     comparison and check stars replace the
                                     automatic APASS ones when they fit the frame
+      equatorial (bool)             session shot in equatorial mode: no field
+                                    rotation, so the target only has to be
+                                    inside the frame, not the alt-az safe
+                                    circle (def False)
       runner     (SirilRunner)
       phot_aperture  (float)        setphot forced-aperture radius px (def 10)
       phot_inner     (float)        sky-annulus inner radius px (def 20)
@@ -1377,6 +1410,7 @@ def run_pipeline(config: dict,
     filt_note  = config.get("filt_note", "")
     obscode    = config.get("obscode", "")
     argos_file = config.get("argos_selection")
+    equatorial = bool(config.get("equatorial", False))
     runner     = config["runner"]
 
     # ── Photometry (setphot) parameters — user-tunable ────────────────────────
@@ -1427,7 +1461,8 @@ def run_pipeline(config: dict,
         f"# Seestar Variable Star Pipeline v{VERSION}",
         f"# Target : {star['name']}  RA={star['ra']:.5f}  Dec={star['dec']:+.5f}",
         f"# Session: {session}",
-        f"# Started: {datetime.datetime.now().isoformat()}",
+        f"# Mount  : {'equatorial' if equatorial else 'alt-az'}",
+        f"# Started:{datetime.datetime.now().isoformat()}",
         "",
     ]
     _orig_on_log = on_log
@@ -1659,29 +1694,47 @@ def run_pipeline(config: dict,
     # With -framing=min, black corners are already eliminated, but the inscribed
     # circle check is still the correct conservative bound for the VSX-filtered
     # candidates.
+    # In equatorial mode there is no field rotation: -framing=min leaves every
+    # registered frame covering the whole reference frame, so the target only
+    # needs its sky annulus inside the frame.
     tdx: Optional[int] = None
     tdy: Optional[int] = None
     SAFE_MARGIN = 50   # px buffer inside inscribed circle (absorbs drift + aperture)
+    EDGE_MARGIN = max(35, math.ceil(phot["outer"]) + 5)   # equatorial: annulus + 5 px
     if naxis1 and naxis2:
         tx, ty = sky_to_pixel(star["ra"], star["dec"], ref_hdr)
         if tx is not None:
             tdx, tdy = _to_disp(tx, ty)
-            # Inscribed circle check in display pixel space
-            cx, cy = naxis1 / 2.0, naxis2 / 2.0
-            safe_r  = min(naxis1, naxis2) / 2.0 - SAFE_MARGIN
-            dist_sq = (tdx - cx) ** 2 + (tdy - cy) ** 2
-            if dist_sq > safe_r ** 2:
-                dist_px = dist_sq ** 0.5
-                on_done(False,
-                        f"'{star['name']}' is outside the alt-az safe zone.\n"
-                        f"Distance from field centre: {dist_px:.0f} px, "
-                        f"safe radius: {safe_r:.0f} px "
-                        f"(inscribed circle of {naxis1}×{naxis2} − {SAFE_MARGIN} px margin).\n"
-                        "Field rotation on an alt-az mount means this star lands in the "
-                        "black corners of many registered frames.\n"
-                        "Re-run the VSX query and choose a star closer to the field centre.")
-                return
-            on_log(f"Target at display pixel ({tdx}, {tdy}) — inside alt-az safe zone ✓")
+            if equatorial:
+                if not (EDGE_MARGIN < tdx < naxis1 - EDGE_MARGIN and
+                        EDGE_MARGIN < tdy < naxis2 - EDGE_MARGIN):
+                    on_done(False,
+                            f"'{star['name']}' is too close to the frame edge.\n"
+                            f"Display pixel ({tdx}, {tdy}) in a {naxis1}×{naxis2} frame; "
+                            f"the photometry needs {EDGE_MARGIN} px from the edge "
+                            f"(sky annulus {phot['outer']:g} px + 5 px).\n"
+                            "Choose a star further from the edge.")
+                    return
+                on_log(f"Target at display pixel ({tdx}, {tdy}) — inside the frame "
+                       f"(equatorial mode, {EDGE_MARGIN} px edge margin) ✓")
+            else:
+                # Inscribed circle check in display pixel space
+                cx, cy = naxis1 / 2.0, naxis2 / 2.0
+                safe_r  = min(naxis1, naxis2) / 2.0 - SAFE_MARGIN
+                dist_sq = (tdx - cx) ** 2 + (tdy - cy) ** 2
+                if dist_sq > safe_r ** 2:
+                    dist_px = dist_sq ** 0.5
+                    on_done(False,
+                            f"'{star['name']}' is outside the alt-az safe zone.\n"
+                            f"Distance from field centre: {dist_px:.0f} px, "
+                            f"safe radius: {safe_r:.0f} px "
+                            f"(inscribed circle of {naxis1}×{naxis2} − {SAFE_MARGIN} px margin).\n"
+                            "Field rotation on an alt-az mount means this star lands in the "
+                            "black corners of many registered frames.\n"
+                            "Re-run the VSX query and choose a star closer to the field centre, "
+                            "or tick 'Equatorial mode' if the session was shot in equatorial mode.")
+                    return
+                on_log(f"Target at display pixel ({tdx}, {tdy}) — inside alt-az safe zone ✓")
         else:
             on_log("Frame WCS not available — skipping bounds check")
 
@@ -1757,7 +1810,7 @@ def run_pipeline(config: dict,
         if not comp_stars:
             on_log("[FALLBACK A] querying APASS (radius=1.5°, dvmag=3.5) …")
             comp_stars = query_apass(star["ra"], star["dec"], star["mag"],
-                                     radius_deg=1.5, n=nstars, dvmag=3.5)
+                                     radius_deg=1.5, n=APASS_CANDIDATES, dvmag=3.5)
             if comp_stars:
                 on_log(f"[FALLBACK A] {len(comp_stars)} APASS comp stars found")
             else:
@@ -1782,7 +1835,7 @@ def run_pipeline(config: dict,
                    "— retrying APASS around field centre (radius=0.5°) …")
             centre_comps = query_apass(
                 float(ref_hdr["CRVAL1"]), float(ref_hdr["CRVAL2"]),
-                star["mag"], radius_deg=0.5, n=nstars, dvmag=3.5)
+                star["mag"], radius_deg=0.5, n=APASS_CANDIDATES, dvmag=3.5)
             for cs in centre_comps:
                 rx, ry = sky_to_pixel(cs["ra"], cs["dec"], ref_hdr)
                 if rx is not None:
@@ -1795,6 +1848,8 @@ def run_pipeline(config: dict,
                 on_log(f"[FALLBACK A] {len(ref_pix)} comp stars from field centre")
             else:
                 on_log("[FALLBACK A] no comp stars in frame (tried target + field centre)")
+        # Candidates come closest in magnitude first: keep the best nstars.
+        ref_pix, _ens_comps = ref_pix[:nstars], _ens_comps[:nstars]
         if ref_pix:
             ref_vmags = [cs.get("vmag") for cs in _ens_comps]
             lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
@@ -1828,6 +1883,7 @@ def run_pipeline(config: dict,
                         inframe_comps.append(cs)
         else:
             inframe_comps = comp_stars  # no WCS — pass all and let Siril decide
+        inframe_comps = inframe_comps[:nstars]
         if not inframe_comps:
             on_done(False,
                     f"No in-frame comparison stars found for '{star['name']}'.\n"

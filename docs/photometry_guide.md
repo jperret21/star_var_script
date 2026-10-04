@@ -42,6 +42,8 @@ After selecting a target from the table, the script uses the comparison and chec
 
 **Obscode:** your AAVSO observer code. Without it no `aavso.csv` is written (see [AAVSO export](#aavso-export)).
 
+**Mount — Equatorial mode:** tick it for a session shot in equatorial mode. In alt-az mode the field rotates during the session, so only the inscribed circle of the frame (radius `min(W, H)/2 − 50 px`) is covered by every registered frame: the VSX list keeps only stars inside it, and step 5 stops if the target is outside. In equatorial mode there is no field rotation, so the whole frame is usable: the VSX list keeps stars at least 50 px from the edge, and step 5 only needs the target's sky annulus inside the frame (`max(35, outer + 5)` px from the edge). The setting is not saved: tick it again when you reopen the session, then re-query VSX.
+
 **Calibration:** the user can provide folders of darks, flats, and/or bias frames. If at least one type is given, the pipeline creates masters automatically at step 0:
 
 ```

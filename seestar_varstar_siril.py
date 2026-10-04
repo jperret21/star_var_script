@@ -35,6 +35,7 @@ from pipeline import (  # noqa: E402
     find_siril_cli,
     read_fits_header,
     list_fits,
+    stars_in_frame,
     stars_in_safe_circle,
     find_siril_user_catalogue,
     update_siril_catalogue,
@@ -294,6 +295,23 @@ class App(tk.Tk):
                      state="readonly", width=34,
                      style="Dark.TCombobox").pack(side="left", padx=(0, 4))
 
+        # Equatorial mode: no field rotation, so the whole frame is usable —
+        # not only the alt-az safe circle (inscribed circle of the frame).
+        mount_row = self._row(obs_card)
+        mount_row.pack(fill="x", pady=(4, 0))
+        tk.Label(mount_row, text="Mount:", bg=BG, fg=FG2,
+                 font=("Helvetica", 11), width=9, anchor="w").pack(side="left")
+        self.equatorial_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(mount_row, text="Equatorial mode (no field rotation)",
+                       variable=self.equatorial_var, bg=BG, fg=FG,
+                       activebackground=BG, activeforeground=FG,
+                       selectcolor=BG2, font=("Helvetica", 11),
+                       highlightthickness=0).pack(side="left")
+        self.equatorial_var.trace_add("write", lambda *_: self._log(
+            "Mount: " + ("equatorial — whole frame usable"
+                         if self.equatorial_var.get() else "alt-az — safe circle only")
+            + " · re-query VSX to refresh the star list"))
+
         nstars_row = self._row(obs_card)
         nstars_row.pack(fill="x", pady=(4, 0))
         tk.Label(nstars_row, text="Comp stars:", bg=BG, fg=FG2,
@@ -495,7 +513,9 @@ class App(tk.Tk):
                 n_check = len(sel.get("check_stars") or [])
                 charts = {c.get("catalogue_chart_id")
                           for c in sel.get("comparison_stars") or []} - {None}
-                text = (f"{n_comp} comparison + {n_check} check star(s) chosen in Argos"
+                text = (f"{n_comp} comparison star(s) chosen in Argos, "
+                        + (f"{n_check} check star(s)" if n_check
+                           else "no check star (none in the Argos selection)")
                         + (f", VSP chart {charts.pop()}" if len(charts) == 1 else ""))
         self.lbl_argos.configure(text=f"Comparison stars: {text}")
 
@@ -788,14 +808,21 @@ class App(tk.Tk):
         # the frame (radius = min(W,H)/2).  With alt-az tracking, field rotation
         # means only this circle is guaranteed to be covered by ALL registered
         # frames — stars outside it can land in the black rotation corners.
+        # Equatorial mode has no field rotation: the whole frame is kept.
         if self.field_wcs_hdr and self.field_naxis1 and self.field_naxis2:
-            filtered = stars_in_safe_circle(stars, self.field_wcs_hdr,
-                                            self.field_naxis1, self.field_naxis2,
-                                            margin=50)
-            safe_r = min(self.field_naxis1, self.field_naxis2) / 2 - 50
+            if self.equatorial_var.get():
+                filtered = stars_in_frame(stars, self.field_wcs_hdr,
+                                          self.field_naxis1, self.field_naxis2,
+                                          margin=50)
+                zone = "the frame (equatorial mode, 50 px edge margin)"
+            else:
+                filtered = stars_in_safe_circle(stars, self.field_wcs_hdr,
+                                                self.field_naxis1, self.field_naxis2,
+                                                margin=50)
+                safe_r = min(self.field_naxis1, self.field_naxis2) / 2 - 50
+                zone = f"alt-az safe zone (inscribed circle r={safe_r:.0f} px)"
             self._log(f"VSX: {len(stars)} in search area → "
-                      f"{len(filtered)} inside alt-az safe zone "
-                      f"(inscribed circle r={safe_r:.0f} px)")
+                      f"{len(filtered)} inside {zone}")
             stars = filtered
         else:
             self._log(f"VSX: {len(stars)} found (no WCS yet — plate-solve for exact filtering)")
@@ -862,6 +889,7 @@ class App(tk.Tk):
             "obscode":    self.obscode_var.get().strip().upper(),
             "argos_selection": (Path(self.argos_var.get().strip())
                                 if self.argos_var.get().strip() else None),
+            "equatorial": self.equatorial_var.get(),
             "runner":     self.runner,
             "phot_aperture":  self.ap_var.get(),
             "phot_inner":     self.inner_var.get(),

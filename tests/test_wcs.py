@@ -1,4 +1,4 @@
-"""Tests for sky_to_pixel and stars_in_safe_circle."""
+"""Tests for sky_to_pixel, stars_in_safe_circle and stars_in_frame."""
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import math
 import unittest
 
-from pipeline import sky_to_pixel, stars_in_safe_circle
+from pipeline import sky_to_pixel, stars_in_frame, stars_in_safe_circle
 
 
 def _cdelt_hdr(crval1, crval2, crpix1, crpix2, cdelt_deg):
@@ -237,6 +237,44 @@ class TestStarsInSafeCircle(unittest.TestCase):
         s = self._star(145.3213, 68.9214, "NSVS")
         result = stars_in_safe_circle([s], self.HDR, self.W, self.H, margin=0)
         self.assertEqual(len(result), 0)
+
+
+
+class TestStarsInFrame(unittest.TestCase):
+    """stars_in_frame — equatorial mode, whole frame minus an edge margin."""
+
+    # Real Seestar S30 Pro registered frame (-framing=min), RR Lyr session shot
+    # in equatorial mode, 2026-09-25.
+    HDR = {
+        "NAXIS1": 1834.0, "NAXIS2": 2251.0,
+        "CRVAL1": 291.444118262612, "CRVAL2": 41.9003498874388,
+        "CRPIX1": 917.5, "CRPIX2": 1126.0,
+        "CDELT1": -0.00102037074573893, "CDELT2": 0.00102053780890616,
+        "PC1_1": 0.998319905047237, "PC1_2": -0.0579427923600136,
+        "PC2_1": -0.0580727356630557, "PC2_2": -0.998312354612828,
+    }
+    W, H = int(HDR["NAXIS1"]), int(HDR["NAXIS2"])
+    RR_LYR = {"name": "RR Lyr", "ra": 291.36630, "dec": 42.78436, "mag": 7.2}
+
+    def test_no_wcs_returns_all(self):
+        self.assertEqual(len(stars_in_frame([self.RR_LYR], {}, self.W, self.H)), 1)
+
+    def test_rr_lyr_outside_safe_circle_but_inside_frame(self):
+        # ~869 px from the centre, 257 px from the frame edge: rejected by the
+        # alt-az safe circle (r = 867 px), kept in equatorial mode.
+        self.assertEqual(stars_in_safe_circle([self.RR_LYR], self.HDR, self.W, self.H), [])
+        self.assertEqual(stars_in_frame([self.RR_LYR], self.HDR, self.W, self.H), [self.RR_LYR])
+
+    def test_star_off_the_frame_excluded(self):
+        # 000-BCG-953 projects to display x ≈ -26, left of the frame.
+        s = {"name": "000-BCG-953", "ra": 292.67158333, "dec": 43.03772222}
+        self.assertEqual(stars_in_frame([s], self.HDR, self.W, self.H), [])
+
+    def test_margin_excludes_star_near_edge(self):
+        # RR Lyr is 257 px from the nearest edge.
+        self.assertEqual(stars_in_frame([self.RR_LYR], self.HDR, self.W, self.H, margin=250),
+                         [self.RR_LYR])
+        self.assertEqual(stars_in_frame([self.RR_LYR], self.HDR, self.W, self.H, margin=260), [])
 
 
 if __name__ == "__main__":
