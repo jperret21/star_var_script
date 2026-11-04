@@ -447,6 +447,27 @@ def find_siril_cli() -> str:
     return ""
 
 
+def siril_cli_command(cli: str) -> list[str]:
+    """Command that runs the siril-cli found by find_siril_cli.
+
+    Run from the Siril AppImage, a script sees the AppImage's own siril-cli
+    on PATH ($APPDIR/usr/bin), but that binary only starts through the
+    AppImage, whose AppRun sets up the bundled libraries (run directly it
+    stops on a missing libgit2). The AppImage runs it given its name as the
+    first argument.
+    """
+    appimage, appdir = os.environ.get("APPIMAGE"), os.environ.get("APPDIR")
+    found = shutil.which(cli)
+    if appimage and appdir and found:
+        try:
+            inside = Path(found).resolve().is_relative_to(Path(appdir).resolve())
+        except OSError:
+            inside = False
+        if inside:
+            return [appimage, "siril-cli"]
+    return [cli]
+
+
 class SirilRunner:
     def __init__(self, log_cb: Callable[[str], None] | None = None):
         self._log = log_cb or print
@@ -471,11 +492,12 @@ class SirilRunner:
         if not cli:
             self._log("ERROR: siril-cli not found. Install Siril 1.4+")
             return False
-        self._log(f"→ {cli} -d {working_dir.name} -s {name}")
+        cmd = siril_cli_command(cli)
+        self._log(f"→ {' '.join(cmd)} -d {working_dir.name} -s {name}")
         # LANGUAGE=C keeps Siril's messages untranslated so step 5 can parse
         # them (Siril's own language preference still overrides it).
         proc = subprocess.Popen(
-            [cli, "-d", str(working_dir), "-s", str(script)],
+            [*cmd, "-d", str(working_dir), "-s", str(script)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             env={**os.environ, "LANGUAGE": "C"},
         )
