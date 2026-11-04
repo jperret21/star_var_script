@@ -15,8 +15,10 @@ import os
 import platform
 import re
 import shutil
+import signal
 import statistics
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -356,6 +358,11 @@ def comp_origin(comps: list[dict]) -> tuple[str, Optional[str]]:
 # APASS candidates fetched by FALLBACK A/B; the in-frame ones are then cut to nstars.
 APASS_CANDIDATES = 50
 
+# findcompstars looks the target up in SIMBAD and queries VizieR from inside
+# Siril, which waits on a dead CDS server for good: past this many seconds it
+# is stopped and FALLBACK A takes over.
+FINDCOMP_TIMEOUT = 120.0  # s
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Siril runner
@@ -386,8 +393,14 @@ class SirilRunner:
                 self._log(f"sirilpy: {e} — using siril-cli")
 
     def run_script(self, working_dir: Path, commands: list[str],
-                   name: str = "_phot.ssf") -> bool:
+                   name: str = "_phot.ssf",
+                   timeout: Optional[float] = None) -> bool:
+        """Run *commands* with siril-cli; False on failure.
+
+        *timeout* (s): stop Siril past it (then timed_out is True) and fail.
+        """
         self.last_output = []
+        self.timed_out = False
         script = working_dir / name
         script.write_text("requires 1.4\n" + "\n".join(commands) + "\n",
                           encoding="utf-8")
@@ -398,17 +411,42 @@ class SirilRunner:
         self._log(f"→ {cli} -d {working_dir.name} -s {name}")
         # LANGUAGE=C keeps Siril's messages untranslated so step 5 can parse
         # them (Siril's own language preference still overrides it).
+        # Its own process group, so that a timeout also stops the children
+        # (the Siril AppImage runs siril-cli in a child process).
+        posix = os.name == "posix"
         proc = subprocess.Popen(
             [cli, "-d", str(working_dir), "-s", str(script)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             env={**os.environ, "LANGUAGE": "C"},
+            start_new_session=posix,
         )
-        for line in proc.stdout:
-            line = line.rstrip()
-            self.last_output.append(line)
-            self._log(line)
-        proc.wait()
-        return proc.returncode == 0
+
+        def stop() -> None:
+            self.timed_out = True
+            self._log(f"Siril did not finish within {timeout:g} s — stopped")
+            try:
+                if posix:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except OSError:
+                pass
+
+        timer = threading.Timer(timeout, stop) if timeout else None
+        if timer:
+            timer.daemon = True
+            timer.start()
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                self.last_output.append(line)
+                self._log(line)
+            proc.wait()
+        finally:
+            if timer:
+                timer.cancel()
+            proc.stdout.close()
+        return proc.returncode == 0 and not self.timed_out
 
     def get_working_dir(self) -> Optional[Path]:
         if self._iface:
@@ -1757,7 +1795,13 @@ def run_pipeline(config: dict,
         f"{stem}_{ref_img_num:0{seq_fixlen}d}.fit"
         if ref_img_num is not None else None
     )
-    if lc_cmd is None and ref_fits_name and (proc / ref_fits_name).exists():
+    # findcompstars needs the CDS servers (SIMBAD, VizieR): skipped while
+    # VizieR is known to be down, stopped after FINDCOMP_TIMEOUT otherwise.
+    if (lc_cmd is None and ref_fits_name and (proc / ref_fits_name).exists()
+            and catalog_sources.source_down("vizier")):
+        on_log("[PRIMARY] skipped — VizieR (CDS) did not answer a moment ago "
+               "→ trying fallback A")
+    elif lc_cmd is None and ref_fits_name and (proc / ref_fits_name).exists():
         if comp_csv.exists():
             comp_csv.unlink()
         star_arg = star["name"].removeprefix("V* ").replace('"', '\\"')
@@ -1766,8 +1810,11 @@ def run_pipeline(config: dict,
             f'cd "{proc}"',
             f"load {ref_fits_name}",
             f'findcompstars "{star_arg}" -narrow -dvmag=3 -emag=0.05 -catalog=apass -out=comp_stars.csv',
-        ], "_s5a_findcomp.ssf")
-        if comp_csv.exists() and comp_csv.stat().st_size > 50:
+        ], "_s5a_findcomp.ssf", timeout=FINDCOMP_TIMEOUT)
+        if getattr(runner, "timed_out", False):
+            on_log(f"[PRIMARY] FAILED — no answer within {FINDCOMP_TIMEOUT:g} s "
+                   "(SIMBAD/VizieR down?) → trying fallback A")
+        elif comp_csv.exists() and comp_csv.stat().st_size > 50:
             kept = truncate_comp_csv(comp_csv, max(3, min(50, nstars)))
             nina_comps = _parse_comp_csv(comp_csv)
             lc_cmd = f"light_curve {registered} 0 -ninastars=comp_stars.csv"
