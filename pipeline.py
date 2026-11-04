@@ -20,6 +20,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+import catalog_sources
+
 VERSION = "0.1.7"
 
 # ── optional runtime deps ────────────────────────────────────────────────────
@@ -56,8 +58,6 @@ SEESTAR = {
     # gain: read from FITS EGAIN header at runtime (GAIN=200 is ISO, not e-/ADU)
 }
 
-VIZIER = "https://vizier.cds.unistra.fr/viz-bin/asu-tsv"
-
 # AAVSO filter codes — (code, extra_note). The photometry is done on the Bayer
 # green channel, (G1+G2)/2, so a Seestar session is reported as TG whatever its
 # filter wheel position; the LP filter is only mentioned in the notes.
@@ -81,10 +81,11 @@ AAVSO_FILTERS = frozenset({
     "MA", "MB", "MI", "ZS", "Y", "HA", "HAC",
 })
 
-# Comparison stars come from APASS DR9 (VizieR II/336, for both Siril's
-# findcompstars and query_apass), not from an AAVSO VSP sequence. For such
-# stars the spec asks for the catalogue name in CHART instead of a chart ID.
-AAVSO_CHART = "APASS DR9"
+# Automatic comparison stars come from APASS DR9 (VizieR II/336, for both
+# Siril's findcompstars and query_apass). For such stars the spec asks for the
+# catalogue name in CHART instead of a chart ID. When VizieR fails, query_apass
+# takes them from an AAVSO VSP chart instead, whose ID then goes in CHART.
+AAVSO_CHART = catalog_sources.APASS_LABEL
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,118 +316,41 @@ def update_siril_catalogue(stars: list[dict], catalogue_path: Path) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Catalog queries via VizieR HTTP (no astroquery)
+# Catalog queries: VizieR, or the AAVSO APIs when VizieR fails (catalog_sources)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _vizier_tsv(catalog: str, ra: float, dec: float,
-                radius_arcmin: float, columns: list[str],
-                filters: dict | None = None, max_rows: int = 500) -> list[list[str]]:
-    """Query VizieR and return parsed data rows. Returns [] on any error."""
-    if not HAS_REQUESTS:
-        return []
-    params: dict = {
-        "-source": catalog,
-        "-c": f"{ra:.6f} {dec:+.6f}",
-        "-c.r": str(radius_arcmin),
-        "-c.u": "arcmin",
-        "-out": ",".join(columns),
-        "-out.max": str(max_rows),
-        # Sort by distance from field centre: without this, VizieR returns rows
-        # in catalog order and -out.max can truncate away the central stars
-        # (e.g. RR Lyr lost among >500 KIC variables in the Kepler field).
-        "-sort": "_r",
-    }
-    if filters:
-        params.update(filters)
-    try:
-        r = requests.get(VIZIER, params=params, timeout=20)
-        r.raise_for_status()
-        # TSV layout: #comments, column names, units, dashed separator, data.
-        rows = []
-        in_data = False
-        for line in r.text.splitlines():
-            if line.startswith("#") or not line.strip():
-                continue
-            if line.startswith("-"):
-                in_data = True
-                continue
-            if in_data:
-                rows.append(line.split("\t"))
-        return rows
-    except Exception:
-        return []
-
-
-def query_vsx(ra: float, dec: float, radius_deg: float) -> list[dict]:
-    """Variable stars from VizieR B/vsx/vsx."""
-    rows = _vizier_tsv(
-        "B/vsx/vsx", ra, dec, radius_deg * 60,
-        ["Name", "Type", "Period", "max", "RAJ2000", "DEJ2000"],
-    )
-    stars = []
-    for parts in rows:
-        if len(parts) < 6:
-            continue
-        try:
-            name     = parts[0].strip()
-            var_type = parts[1].strip() or "?"
-            period   = parts[2].strip()
-            mag_str  = parts[3].strip()
-            ra_s     = parts[4].strip()
-            dec_s    = parts[5].strip()
-            if not ra_s or not dec_s:
-                continue
-            stars.append({
-                "name":     name,
-                "ra":       float(ra_s),
-                "dec":      float(dec_s),
-                "mag":      float(mag_str) if mag_str else 99.0,
-                "var_type": var_type,
-                "period":   f"{float(period):.4f} d" if period else "—",
-                "dist":     0.0,
-            })
-        except (ValueError, IndexError):
-            continue
-    return stars
+def query_vsx(ra: float, dec: float, radius_deg: float,
+              on_log: Optional[Callable[[str], None]] = None) -> list[dict]:
+    """Variable stars from VizieR B/vsx/vsx, else from the AAVSO VSX API."""
+    return catalog_sources.fetch_vsx(ra, dec, radius_deg, on_log=on_log)[0]
 
 
 def query_apass(ra: float, dec: float, target_mag: float,
                 radius_deg: float = 1.0, n: int = 6,
-                dvmag: float = 2.0) -> list[dict]:
-    """Comparison stars from VizieR II/336/apass9.
+                dvmag: float = 2.0,
+                on_log: Optional[Callable[[str], None]] = None) -> list[dict]:
+    """Comparison stars from VizieR II/336/apass9, else from an AAVSO VSP chart.
 
     dvmag: max magnitude difference from target. Use 3.5+ when target_mag
     comes from VSX (which stores max brightness, often 1-2 mag brighter than mean).
 
-    The magnitude range is filtered by VizieR: rows come sorted by distance
-    and capped at max_rows, so filtering here instead would only see the few
-    hundred nearest (mostly faint) stars — for a bright target, none in range.
+    Each star has ra, dec, vmag, and source/chart for the AAVSO export
+    (see comp_origin).
     """
-    rows = _vizier_tsv(
-        "II/336/apass9", ra, dec, radius_deg * 60,
-        ["RAJ2000", "DEJ2000", "Vmag", "e_Vmag"],
-        filters={"e_Vmag": "<0.05",
-                 "Vmag": f"{target_mag - dvmag:.2f}..{target_mag + dvmag:.2f}"},
-        max_rows=200,
-    )
-    comps = []
-    for parts in rows:
-        if len(parts) < 3:
-            continue
-        try:
-            ra_c  = float(parts[0].strip())
-            dec_c = float(parts[1].strip())
-            vmag  = float(parts[2].strip())
-            if abs(vmag - target_mag) > dvmag:
-                continue
-            sep = ((ra_c - ra) * 3600) ** 2 + ((dec_c - dec) * 3600) ** 2
-            if sep < 25:  # < 5 arcsec from target
-                continue
-            comps.append({"ra": ra_c, "dec": dec_c, "vmag": vmag})
-        except (ValueError, IndexError):
-            continue
-    comps.sort(key=lambda c: abs(c["vmag"] - target_mag))
-    return comps[:n]
+    return catalog_sources.fetch_comps(ra, dec, target_mag, radius_deg=radius_deg,
+                                       n=n, dvmag=dvmag, on_log=on_log)[0]
+
+
+def comp_origin(comps: list[dict]) -> tuple[str, Optional[str]]:
+    """(comp_source, chart) of the export for the comparison stars *comps*.
+
+    APASS stars give AAVSO_CHART; VSP stars their chart ID, or None (CHART na)
+    when they come from several charts or are mixed with APASS stars.
+    """
+    sources = sorted({c.get("source") or AAVSO_CHART for c in comps})
+    charts = {c.get("chart", AAVSO_CHART) for c in comps}
+    chart = charts.pop() if len(charts) == 1 else None
+    return " + ".join(sources) or AAVSO_CHART, chart
 
 
 # APASS candidates fetched by FALLBACK A/B; the in-frame ones are then cut to nstars.
@@ -1851,15 +1775,17 @@ def run_pipeline(config: dict,
         else:
             on_log(f"[PRIMARY] FAILED — '{star_arg}' not in Siril catalog → trying fallback A")
 
-    # ── FALLBACK A: APASS via VizieR + pixel coords ───────────────────────────
+    # ── FALLBACK A: APASS via VizieR (else AAVSO VSP) + pixel coords ──────────
     # dvmag=3.5: VSX reports max brightness, star may be 1-2 mag fainter at minimum.
     if lc_cmd is None and ref_img_num is not None:
         if not comp_stars:
             on_log("[FALLBACK A] querying APASS (radius=1.5°, dvmag=3.5) …")
             comp_stars = query_apass(star["ra"], star["dec"], star["mag"],
-                                     radius_deg=1.5, n=APASS_CANDIDATES, dvmag=3.5)
+                                     radius_deg=1.5, n=APASS_CANDIDATES, dvmag=3.5,
+                                     on_log=on_log)
             if comp_stars:
-                on_log(f"[FALLBACK A] {len(comp_stars)} APASS comp stars found")
+                on_log(f"[FALLBACK A] {len(comp_stars)} comp stars found "
+                       f"({comp_origin(comp_stars)[0]})")
             else:
                 on_log(f"[FALLBACK A] no APASS stars (target mag={star['mag']:.1f}) → trying fallback B")
 
@@ -1882,7 +1808,8 @@ def run_pipeline(config: dict,
                    "— retrying APASS around field centre (radius=0.5°) …")
             centre_comps = query_apass(
                 float(ref_hdr["CRVAL1"]), float(ref_hdr["CRVAL2"]),
-                star["mag"], radius_deg=0.5, n=APASS_CANDIDATES, dvmag=3.5)
+                star["mag"], radius_deg=0.5, n=APASS_CANDIDATES, dvmag=3.5,
+                on_log=on_log)
             for cs in centre_comps:
                 rx, ry = sky_to_pixel(cs["ra"], cs["dec"], ref_hdr)
                 if rx is not None:
@@ -1899,6 +1826,7 @@ def run_pipeline(config: dict,
         ref_pix, _ens_comps = ref_pix[:nstars], _ens_comps[:nstars]
         if ref_pix:
             ref_vmags = [cs.get("vmag") for cs in _ens_comps]
+            comp_source, chart = comp_origin(_ens_comps)
             lc_cmd = f"light_curve {registered} 0 -at={tdx},{tdy}"
             for rdx, rdy in ref_pix:
                 lc_cmd += f" -refat={rdx},{rdy}"
@@ -1938,6 +1866,7 @@ def run_pipeline(config: dict,
                     "APASS reference stars in the image. Try a different star.")
             return
         ref_vmags = [cs.get("vmag") for cs in inframe_comps]
+        comp_source, chart = comp_origin(inframe_comps)
         on_log("[FALLBACK B] using sky coordinates (-wcs/-refwcs)")
         lc_cmd = (f"light_curve {registered} 0 "
                   f"-wcs={star['ra']:.6f},{star['dec']:.6f}")
