@@ -22,7 +22,7 @@ the same star can be given; they are fitted together.
 
 Options
 -------
-    --period P      Pulsation period in days (default: VSX, via VizieR)
+    --period P      Pulsation period in days (default: VSX, via VizieR or AAVSO)
     --band B        Template band: u, g, r, i or z (default: r)
     --type T        Template library: ab, c or all (default: ab)
     --template ID   Fit this template only (e.g. 105)
@@ -99,6 +99,7 @@ _TEMPLATE_NAME  = re.compile(r"(\d+)([ugriz])\.dat")
 RRC_IDS         = {0, 1}   # near-sinusoidal RRc shapes; 100+ are RRab
 
 VIZIER       = "https://vizier.cds.unistra.fr/viz-bin/asu-tsv"
+AAVSO_VSX    = "https://vsx.aavso.org/index.php"   # www.aavso.org/vsx: Cloudflare check
 LIGHT_DAY_AU = 0.0057755183          # light travel time over 1 au [d]
 
 AMP_BOUNDS   = (0.05, 2.5)           # mag — keeps a fit to a short, nearly
@@ -216,15 +217,19 @@ def target_coords(star_dir: Path) -> tuple[float, float] | None:
 
 
 def vsx_ephemeris(ra: float, dec: float) -> dict | None:
-    """Name, type, period and epoch of the nearest VSX star within 30″."""
+    """Name, type, period and epoch of the nearest VSX star within 30″.
+
+    From VizieR, else from the AAVSO VSX API when VizieR does not answer.
+    """
     params = {"-source": "B/vsx/vsx", "-c": f"{ra:.6f} {dec:+.6f}", "-c.rs": "30",
               "-out": "Name,Type,Period,Epoch", "-out.add": "_r", "-sort": "_r"}
     try:
         with urllib.request.urlopen(f"{VIZIER}?{urllib.parse.urlencode(params)}",
                                     timeout=20) as r:
             text = r.read().decode("utf-8", errors="replace")
-    except OSError:
-        return None
+    except OSError as e:
+        print(f"[warn] VizieR VSX: {e} — trying the AAVSO VSX API", file=sys.stderr)
+        return aavso_vsx_ephemeris(ra, dec)
     lines = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
     try:
         header = [c.strip() for c in lines[0].split("\t")]
@@ -241,6 +246,38 @@ def vsx_ephemeris(ra: float, dec: float) -> dict | None:
 
     return {"name": row.get("Name", ""), "type": row.get("Type", ""),
             "period": num("Period"), "epoch": num("Epoch")}
+
+
+def aavso_vsx_ephemeris(ra: float, dec: float) -> dict | None:
+    """vsx_ephemeris from the AAVSO VSX api.list (radius in degrees)."""
+    params = {"view": "api.list", "ra": f"{ra:.6f}", "dec": f"{dec:+.6f}",
+              "radius": f"{30 / 3600:.6f}", "format": "json"}
+    try:
+        with urllib.request.urlopen(f"{AAVSO_VSX}?{urllib.parse.urlencode(params)}",
+                                    timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+        objs = (data.get("VSXObjects") or {}).get("VSXObject") or []
+    except (OSError, ValueError, AttributeError):
+        return None
+    if isinstance(objs, dict):
+        objs = [objs]
+
+    def num(o, key):
+        try:
+            return float(o.get(key) or "")
+        except ValueError:
+            return None
+
+    def sep2(o):
+        d_ra = ((num(o, "RA2000") or 0.0) - ra) * np.cos(np.radians(dec))
+        return d_ra ** 2 + ((num(o, "Declination2000") or 0.0) - dec) ** 2
+
+    objs = [o for o in objs if num(o, "RA2000") is not None]
+    if not objs:
+        return None
+    o = min(objs, key=sep2)
+    return {"name": o.get("Name", ""), "type": o.get("VariabilityType", ""),
+            "period": num(o, "Period"), "epoch": num(o, "Epoch")}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

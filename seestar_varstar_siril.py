@@ -6,8 +6,8 @@ Run from Siril: Script > Run Script > seestar_varstar_siril.py
 
 Requirements:
   - Siril 1.4+ open, session folder set as working directory
-  - pipeline.py in the same directory as this script
-  - Internet access for VizieR catalog queries
+  - pipeline.py and catalog_sources.py in the same directory as this script
+  - Internet access for the catalog queries (VizieR, else the AAVSO APIs)
 
 Troubleshoot:  Script > Run Script > test_connections.py
 """
@@ -785,13 +785,13 @@ class App(tk.Tk):
                                  "requests not available.\n"
                                  "Run: test_connections.py for diagnostics.")
             return
-        self._log("Querying VizieR VSX catalog…")
+        self._log("Querying VSX catalog (VizieR, else AAVSO)…")
         self._btn_state(False)
         threading.Thread(target=self._fetch_vsx_bg, daemon=True).start()
 
     def _fetch_vsx_bg(self):
         radius = max(SEESTAR["fov_w"], SEESTAR["fov_h"]) * 0.75
-        stars = query_vsx(self.field_ra, self.field_dec, radius)
+        stars = query_vsx(self.field_ra, self.field_dec, radius, on_log=self._log)
         if not stars:
             self.after(0, lambda: (
                 self._log("VSX: no results — check connection with test_connections.py"),
